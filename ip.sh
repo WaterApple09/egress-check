@@ -401,6 +401,11 @@ if ! install -d -m 700 "$IP_LOOKUP_CACHE_DIR" 2>/dev/null; then
     err "无法创建/访问 IP 反查缓存目录: $IP_LOOKUP_CACHE_DIR"; exit 1
 fi
 [[ -O "$IP_LOOKUP_CACHE_DIR" ]] && chmod 700 "$IP_LOOKUP_CACHE_DIR" 2>/dev/null || true
+if [[ "${EGRESS_DEBUG_MTR:-0}" == 1 && "$MTR_AVAILABLE" == 1 ]]; then
+    if install -d -m 700 "$CACHE_DIR/mtr-debug" 2>/dev/null; then
+        LC_ALL=C timeout -k 1 1 mtr --version > "$CACHE_DIR/mtr-debug/version.txt" 2>&1 || true
+    fi
+fi
 
 sanitize() { LC_ALL=C tr -d '\000-\037\177'; }
 strip_bom() { local s="$1"; s="${s#$'\xef\xbb\xbf'}"; printf '%s' "$s"; }
@@ -603,6 +608,11 @@ run_mtr_report() {
     if [[ "$mode" == compat ]]; then cmd+=(-b); else cmd+=(-n); fi
     cmd+=("$destination")
     if command -v nice >/dev/null 2>&1; then cmd=(nice -n "$MTR_NICE" "${cmd[@]}"); fi
+    if [[ "${EGRESS_DEBUG_MTR:-0}" == 1 ]]; then
+        printf 'command: LC_ALL=C timeout -k 1 %q ' "$limit" >&2
+        printf '%q ' "${cmd[@]}" >&2
+        printf '\n' >&2
+    fi
     LC_ALL=C timeout -k 1 "$limit" "${cmd[@]}"
 }
 
@@ -696,11 +706,12 @@ parse_mtr_report() {
                 # Statistics occupy the rightmost columns. Hostnames, ASN
                 # prefixes and hostname (IP) pairs may occupy several words.
                 stats=0; loss_offset=-1; sent_offset=-1; avg_offset=-1
-                for (i=2;i<=NF;i++) {
+                for (i=NF;i>=3;i--) {
+                    if ($i !~ /^(Loss%|Drop|Rcv|Snt|Last|Avg|Best|Wrst|StDev|Gmean|Jttr|Javg|Jmax|Jint)$/) break
+                    stats++
                     if ($i=="Loss%") loss_offset=NF-i
                     if ($i=="Snt") sent_offset=NF-i
                     if ($i=="Avg") avg_offset=NF-i
-                    if ($i ~ /^(Loss%|Drop|Rcv|Snt|Last|Avg|Best|Wrst|StDev|Gmean|Jttr|Javg|Jmax|Jint)$/) stats++
                 }
                 header=(loss_offset>=0 && sent_offset>=0 && avg_offset>=0)
                 next
@@ -748,7 +759,7 @@ parse_mtr_report() {
 # compatibility attempt, while transient timeouts respect MTR_ATTEMPTS.
 first_public_hop() {
     local ip_flag="$1" domain="$2" output attempt parsed ip latency path_ips rc
-    local mode=numeric format_retry=0 diagnostic=""
+    local mode=numeric format_retry=0 diagnostic="" known_latency=""
     local target destination fallback=$'__PROBE_FAILED__\t-\t' deadline remaining limit
     is_valid_domain "$domain" || { printf '%s' "$fallback"; return; }
     if [[ "${MTR_AVAILABLE:-1}" == 0 || ( "$ip_flag" == -4 && "${V4_MTR_AVAILABLE:-1}" == 0 ) || ( "$ip_flag" == -6 && "${V6_MTR_AVAILABLE:-1}" == 0 ) ]]; then
@@ -789,17 +800,24 @@ first_public_hop() {
             esac
         fi
         parsed=""
-        if [[ -n "$output" ]]; then
+        if [[ -n "$output" || "$rc" == 0 ]]; then
             parsed="$(printf '%s\n' "$output" | parse_mtr_report "$ip_flag" "$target" "$diagnostic")" || parsed=$'__PARSE_ERROR__\t-\t'
         fi
         IFS=$'\t' read -r ip latency path_ips <<< "$parsed"
+        if [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            known_latency="$latency"
+        elif [[ -n "$known_latency" && -n "$ip" ]]; then
+            latency="$known_latency"
+            parsed="${ip}"$'\t'"${latency}"$'\t'"${path_ips}"
+        fi
         case "$ip" in
             __HIDDEN__)
-                if (( rc == 0 )); then printf '%s' "$parsed"; return; fi ;;
+                # A confirmed target reply remains valid in partial output.
+                printf '%s' "$parsed"; return ;;
             __PARSE_ERROR__)
+                # Keep confirmed RTT even if the report was cut off by timeout.
+                if [[ "$latency" != - || "$fallback" != __PARSE_ERROR__* ]]; then fallback="$parsed"; fi
                 if (( rc == 0 )); then
-                    # A later compatibility attempt must not erase confirmed RTT.
-                    if [[ "$latency" != - || "$fallback" != __PARSE_ERROR__* ]]; then fallback="$parsed"; fi
                     if (( format_retry == 0 )); then mode=compat; format_retry=1; continue; fi
                     break
                 fi ;;
@@ -814,6 +832,8 @@ first_public_hop() {
                 fi ;;
             *) printf '%s' "$parsed"; return ;;
         esac
+        # The compatibility mode is attempted only once, even when it times out.
+        [[ "$mode" == compat ]] && break
         # A non-timeout command error is permanent for this probe. Preserve any
         # valid route from partial output above, but do not repeat the failure.
         if (( rc != 0 && rc != 124 )); then break; fi

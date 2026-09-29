@@ -157,7 +157,7 @@ class MtrTests(unittest.TestCase):
         data = report(*(row(ip) for ip in ('::', '::1', 'fe80::1', 'febf::1', 'fc00::1', 'fd00::1', 'ff02::1', '2606:4700::1111')))
         self.assertEqual(self.parse(data, target='2606:4700::1111', family='-6')[0], '__HIDDEN__')
 
-    def probe(self, outputs, statuses=None):
+    def probe(self, outputs, statuses=None, attempts=2):
         statuses = statuses or [0] * len(outputs)
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -174,12 +174,11 @@ run_mtr_report() {
     cat "$D/$n.txt"
     return "$(cat "$D/$n.rc")"
 }
-MTR_ATTEMPTS=2
 first_public_hop -4 example.com
 printf '\\n'
 cat "$D/calls"
 '''
-            result = self.shell('D=' + shlex.quote(tmp) + '\n' + body)
+            result = self.shell('D=' + shlex.quote(tmp) + '\nMTR_ATTEMPTS=' + str(attempts) + '\n' + body)
             return result.splitlines()
 
     def test_parse_error_gets_one_compatibility_attempt(self):
@@ -192,9 +191,9 @@ cat "$D/calls"
         result = self.probe([report(row('???', loss='100')), report(row('168.95.98.254'), row('104.18.33.45'))])
         self.assertEqual(result, ['__UNCONFIRMED__\t-\t', '1'])
 
-    def test_command_failure_never_hidden(self):
+    def test_timeout_preserves_confirmed_target_reply(self):
         result = self.probe([report(row('104.18.33.45'))] * 2, [124] * 2)
-        self.assertEqual(result, ['__PROBE_FAILED__\t-\t', '2'])
+        self.assertEqual(result, ['__HIDDEN__\t9.0\t', '1'])
 
     def test_command_failure_stops_immediately(self):
         result = self.probe(['mtr failed'], [1])
@@ -457,6 +456,7 @@ first_public_hop -4 example.com
             ('missing', '', 0, 'partial', 'mtr_unavailable', '50.0', 0),
             ('permission', 'mtr: Operation not permitted', 1, 'partial', 'mtr_unavailable', '50.0', 60),
             ('parse', 'bad report', 0, 'partial', 'parse_error', '50.0', 0),
+            ('parse_with_rtt', report('bad row', row('104.18.33.45')), 0, 'partial', 'parse_error', '9.0', 0),
             ('hidden_path', report(row('???', loss='100')), 0, 'partial', 'no_public_hop', '50.0', 0),
             ('command', 'mtr: failed', 1, 'partial', 'probe_failed', '50.0', 0),
             ('no_target_reply', report(row('168.95.98.254'), row('???', loss='100')), 0, 'ok', None, '50.0', 0),
@@ -509,8 +509,9 @@ esac
                         self.assertEqual(item['status'], status)
                         self.assertEqual(item.get('reason'), reason)
                         self.assertEqual(item['latency_ms'], float(latency) if latency else None)
-                        self.assertEqual(item['latency_source'], 'tcp_connect' if latency else None)
-                        self.assertEqual(item['latency_port'], 443 if latency else None)
+                        source = 'mtr' if mode == 'parse_with_rtt' else 'tcp_connect' if latency else None
+                        self.assertEqual(item['latency_source'], source)
+                        self.assertEqual(item['latency_port'], 443 if source == 'tcp_connect' else None)
                         if status != 'ok':
                             self.assertIsNone(item['first_hop'])
                             self.assertIsNone(item['asn'])
@@ -520,13 +521,19 @@ esac
                     self.assertEqual(summary['total'], 2)
                     if status != 'ok':
                         self.assertIsNone(data['ipv4']['split_routing_detected'])
-                    self.assertEqual(len((directory / 'tcp-calls').read_text().splitlines()), 2)
+                    if mode == 'parse_with_rtt':
+                        self.assertFalse((directory / 'tcp-calls').exists())
+                    else:
+                        self.assertEqual(len((directory / 'tcp-calls').read_text().splitlines()), 2)
                     if mode == 'missing':
                         self.assertFalse((directory / 'mtr-calls').exists())
                     if mode == 'permission':
                         self.assertEqual(len((directory / 'mtr-calls').read_text().splitlines()), 1)
                     if output_json:
                         self.assertEqual(json.loads(result.stdout), data)
+                    elif mode == 'parse_with_rtt':
+                        self.assertIn('仅目标延迟，路径不可用', result.stdout)
+                        self.assertIn('9.0ms', result.stdout)
                     elif latency:
                         self.assertIn('50.0ms TCP', result.stdout)
                         if status == 'partial':
@@ -561,6 +568,49 @@ esac
     def test_compatibility_report_can_recover(self):
         result = self.probe(['bad report', report(row('router (168.95.98.254)'), row('target (104.18.33.45)'))])
         self.assertEqual(result, ['168.95.98.254\t9.0\t168.95.98.254', '2'])
+
+    def test_compatibility_timeout_never_repeats(self):
+        self.assertEqual(self.probe(['bad report', ''], [0, 124], attempts=8),
+                         ['__PARSE_ERROR__\t-\t', '2'])
+
+    def test_empty_report_gets_only_one_compatibility_attempt(self):
+        self.assertEqual(self.probe(['', ''], attempts=8), ['__PARSE_ERROR__\t-\t', '2'])
+
+    def test_compatibility_uses_name_and_address_mode(self):
+        body = r"""
+nice() { shift 2; "$@"; }
+timeout() { shift 3; "$@"; }
+mtr() { printf '%s\n' "$*"; }
+MTR_NICE=0 MTR_COUNT=3 MTR_MAXTTL=30
+run_mtr_report -4 104.18.33.45 1 compat
+"""
+        result = self.shell(body)
+        self.assertIn('-b', result)
+        self.assertIn('-w', result)
+        self.assertNotIn('-n', result)
+
+    def test_format_fallback_shares_total_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / 'mtr'
+            executable.write_text('#!/bin/sh\ncase "$*" in *-b*) sleep 30;; *) echo bad_report;; esac\n')
+            executable.chmod(0o755)
+            body = 'PATH=' + shlex.quote(tmp) + ':"$PATH"\n' + r"""
+resolve_mtr_target() { printf 104.18.33.45; }
+MTR_NICE=0 MTR_COUNT=3 MTR_MAXTTL=30 MTR_ATTEMPTS=8 MTR_TOTAL_TIMEOUT=1
+first_public_hop -4 example.com
+"""
+            started = time.monotonic()
+            self.assertEqual(self.shell(body), '__PARSE_ERROR__\t-\t')
+            self.assertLess(time.monotonic() - started, 4)
+
+    def test_timeout_keeps_partial_report_target_timing(self):
+        data = report('bad row', row('104.18.33.45', avg='8.5'))
+        self.assertEqual(self.probe([data, ''], [124, 124]), ['__PARSE_ERROR__\t8.5\t', '2'])
+
+    def test_recovered_route_keeps_previous_target_timing(self):
+        data = report('bad row', row('104.18.33.45', avg='8.5'))
+        self.assertEqual(self.probe([data, report(row('168.95.98.254'))]),
+                         ['168.95.98.254\t8.5\t168.95.98.254', '2'])
 
     def test_parse_diagnostic_identifies_first_bad_line(self):
         with tempfile.TemporaryDirectory() as tmp:
