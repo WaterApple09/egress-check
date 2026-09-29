@@ -11,7 +11,7 @@
 #   3. IPv6 线路分流检测 (不可用则跳过)
 #
 # 以默认出口 ASN 为基准: 相同=未分流(绿), 不同=分流(高亮告警).
-# 退出码: 0=成功  1=配置/依赖错误  2=有域名探测失败
+# 退出码: 0=成功  1=配置/依赖错误  2=有域名路径探测不完整（可能仍有连接延迟）
 #
 # 环境变量: MTR_CONCURRENCY(组内并发数,默认6)  EGRESS_RULES  EGRESS_CACHE  IP_LOOKUP_CACHE_TTL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +57,9 @@ ONLY_CAT=""
 MTR_TIMEOUT="${MTR_TIMEOUT:-20}"
 MTR_MAXTTL="${MTR_MAXTTL:-30}"
 MTR_COUNT="${MTR_COUNT:-3}"
-MTR_ATTEMPTS="${MTR_ATTEMPTS:-4}"
+MTR_ATTEMPTS="${MTR_ATTEMPTS:-2}"
+MTR_TOTAL_TIMEOUT="${MTR_TOTAL_TIMEOUT:-12}"
+LATENCY_TIMEOUT="${LATENCY_TIMEOUT:-3}"
 MTR_NICE="${MTR_NICE:-10}"
 PATH_SUMMARY_LIMIT="${PATH_SUMMARY_LIMIT:-8}"
 MTR_BASE_DOMAIN="${MTR_BASE_DOMAIN:-google.com}"
@@ -307,8 +309,7 @@ need() {
 }
 ensure_runtime_deps() {
     local missing=()
-    local need_mtr=0 need_jq=0
-    command -v mtr >/dev/null 2>&1 || { missing+=(mtr); need_mtr=1; }
+    local need_jq=0
     command -v jq >/dev/null 2>&1 || { missing+=(jq); need_jq=1; }
     [[ ${#missing[@]} -eq 0 ]] && return 0
 
@@ -317,8 +318,8 @@ ensure_runtime_deps() {
         if command -v sudo >/dev/null 2>&1; then sudo="sudo"
         else
             err "缺少依赖: ${missing[*]}, 当前非 root 且无 sudo, 无法自动安装"
-            printf "    Debian/Ubuntu: apt install mtr-tiny jq\n" >&2
-            printf "    Alpine: apk add mtr jq\n" >&2
+            printf "    Debian/Ubuntu: apt install jq\n" >&2
+            printf "    Alpine: apk add jq\n" >&2
             exit 1
         fi
     fi
@@ -327,49 +328,41 @@ ensure_runtime_deps() {
     if command -v apt-get >/dev/null 2>&1; then
         $sudo apt-get update -qq >/dev/null 2>&1 || true
         local apt_pkgs=()
-        [[ $need_mtr -eq 1 ]] && apt_pkgs+=(mtr-tiny)
         [[ $need_jq -eq 1 ]] && apt_pkgs+=(jq)
         $sudo apt-get install -y "${apt_pkgs[@]}" >/dev/null 2>&1 || {
             apt_pkgs=()
-            [[ $need_mtr -eq 1 ]] && apt_pkgs+=(mtr)
             [[ $need_jq -eq 1 ]] && apt_pkgs+=(jq)
             $sudo apt-get install -y "${apt_pkgs[@]}" >/dev/null 2>&1 || true
         }
     elif command -v apk >/dev/null 2>&1; then
         local apk_pkgs=()
-        [[ $need_mtr -eq 1 ]] && apk_pkgs+=(mtr)
         [[ $need_jq -eq 1 ]] && apk_pkgs+=(jq)
         $sudo apk add --no-cache "${apk_pkgs[@]}" >/dev/null 2>&1 || true
     elif command -v yum >/dev/null 2>&1; then
         local yum_pkgs=()
-        [[ $need_mtr -eq 1 ]] && yum_pkgs+=(mtr)
         [[ $need_jq -eq 1 ]] && yum_pkgs+=(jq)
         $sudo yum install -y "${yum_pkgs[@]}" >/dev/null 2>&1 || true
     elif command -v dnf >/dev/null 2>&1; then
         local dnf_pkgs=()
-        [[ $need_mtr -eq 1 ]] && dnf_pkgs+=(mtr)
         [[ $need_jq -eq 1 ]] && dnf_pkgs+=(jq)
         $sudo dnf install -y "${dnf_pkgs[@]}" >/dev/null 2>&1 || true
     elif command -v pacman >/dev/null 2>&1; then
         local pacman_pkgs=()
-        [[ $need_mtr -eq 1 ]] && pacman_pkgs+=(mtr)
         [[ $need_jq -eq 1 ]] && pacman_pkgs+=(jq)
         $sudo pacman -Sy --noconfirm "${pacman_pkgs[@]}" >/dev/null 2>&1 || true
     fi
 
     local still_missing=()
-    command -v mtr >/dev/null 2>&1 || still_missing+=(mtr)
     command -v jq >/dev/null 2>&1 || still_missing+=(jq)
     if [[ ${#still_missing[@]} -eq 0 ]]; then
         printf "%s[+]%s 依赖安装成功: %s\n" "$GREEN" "$R" "${missing[*]}" >&2
-        { ${sudo} setcap cap_net_raw+ep "$(command -v mtr)" >/dev/null 2>&1 || true; }
         return 0
     fi
 
     err "依赖自动安装失败: ${still_missing[*]}"
-    printf "    Debian/Ubuntu: apt install mtr-tiny jq\n" >&2
-    printf "    Alpine: apk add mtr jq\n" >&2
-    printf "    CentOS/RHEL: yum install mtr jq\n" >&2
+    printf "    Debian/Ubuntu: apt install jq\n" >&2
+    printf "    Alpine: apk add jq\n" >&2
+    printf "    CentOS/RHEL: yum install jq\n" >&2
     exit 1
 }
 ensure_runtime_deps
@@ -377,6 +370,16 @@ need curl    "apt install curl"
 need timeout "coreutils"
 need awk
 need grep
+for setting in MTR_ATTEMPTS MTR_TIMEOUT MTR_TOTAL_TIMEOUT LATENCY_TIMEOUT; do
+    if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
+        err "$setting 必须为正整数"; exit 1
+    fi
+done
+MTR_AVAILABLE=1
+if ! command -v mtr >/dev/null 2>&1; then
+    MTR_AVAILABLE=0
+    err "mtr 未安装，将仅检测 TCP 443 连接延迟（无法判断路径分流）"
+fi
 
 USE_EMBEDDED_RULES=0
 if [[ ! -f "$RULES_FILE" ]]; then
@@ -595,18 +598,16 @@ ip_family() {
 }
 
 run_mtr_report() {
-    local ip_flag="$1" mode="$2" destination="$3"
-    local -a cmd=(mtr "$ip_flag" -r -c "$MTR_COUNT" -m "$MTR_MAXTTL")
-    if [[ "$mode" == "numeric" ]]; then cmd+=(-n); else cmd+=(-b); fi
-    cmd+=("$destination")
+    local ip_flag="$1" destination="$2" limit="${3:-$MTR_TIMEOUT}"
+    local -a cmd=(mtr "$ip_flag" -r -n -c "$MTR_COUNT" -m "$MTR_MAXTTL" "$destination")
     if command -v nice >/dev/null 2>&1; then cmd=(nice -n "$MTR_NICE" "${cmd[@]}"); fi
-    LC_ALL=C timeout "$MTR_TIMEOUT" "${cmd[@]}"
+    LC_ALL=C timeout -k 1 "$limit" "${cmd[@]}"
 }
 
 # Pin the probe to one resolver result so a responding hop can be identified as
 # the actual destination. getent is optional; without it we report uncertainty.
 resolve_mtr_target() {
-    local ip_flag="$1" domain="$2" database line address
+    local ip_flag="$1" domain="$2" limit="${3:-$ENV_TIMEOUT}" database line address
     command -v getent >/dev/null 2>&1 || return 0
     if [[ "$ip_flag" == "-6" ]]; then database=ahostsv6; else database=ahostsv4; fi
     while IFS= read -r line; do
@@ -618,7 +619,7 @@ resolve_mtr_target() {
         fi
         printf '%s' "$address"
         return 0
-    done < <(LC_ALL=C timeout "$ENV_TIMEOUT" getent "$database" "$domain" 2>/dev/null || true)
+    done < <(LC_ALL=C timeout -k 1 "$limit" getent "$database" "$domain" 2>/dev/null || true)
 }
 
 # Kept inline so bash <(curl .../ip.sh) remains self-contained. No awk interval
@@ -719,53 +720,111 @@ parse_mtr_report() {
         }'
 }
 
+# A single budget covers target resolution and every MTR attempt. Repeating a
+# format/permission error cannot improve the route, and hidden is conclusive.
 first_public_hop() {
-    local ip_flag="$1" domain="$2" output attempt parsed ip latency path_ips mode rc
-    local target destination fallback="__PROBE_FAILED__" fallback_rank=0 rank
-    is_valid_domain "$domain" || { printf '__PROBE_FAILED__\t-\t'; return; }
-    target="$(resolve_mtr_target "$ip_flag" "$domain")"
+    local ip_flag="$1" domain="$2" output attempt parsed ip latency path_ips rc
+    local target destination fallback=$'__PROBE_FAILED__\t-\t' deadline remaining limit
+    is_valid_domain "$domain" || { printf '%s' "$fallback"; return; }
+    if [[ "${MTR_AVAILABLE:-1}" == 0 || ( "$ip_flag" == -4 && "${V4_MTR_AVAILABLE:-1}" == 0 ) || ( "$ip_flag" == -6 && "${V6_MTR_AVAILABLE:-1}" == 0 ) ]]; then
+        printf '__MTR_UNAVAILABLE__\t-\t'; return
+    fi
+    deadline=$((SECONDS + ${MTR_TOTAL_TIMEOUT:-12}))
+    limit=${ENV_TIMEOUT:-5}
+    (( limit > 3 )) && limit=3
+    (( limit > ${MTR_TOTAL_TIMEOUT:-12} )) && limit=${MTR_TOTAL_TIMEOUT:-12}
+    target="$(resolve_mtr_target "$ip_flag" "$domain" "$limit")"
     destination="${target:-$domain}"
     for ((attempt=1; attempt<=MTR_ATTEMPTS; attempt++)); do
-        for mode in numeric names; do
-            rc=0
-            output="$(run_mtr_report "$ip_flag" "$mode" "$destination" 2>&1)" || rc=$?
-            if [[ "${EGRESS_DEBUG_MTR:-0}" == "1" ]]; then
-                local dbg_dir dbg_file safe_domain
-                dbg_dir="$CACHE_DIR/mtr-debug"
-                install -d -m 700 "$dbg_dir" 2>/dev/null || true
-                safe_domain="$(printf '%s' "$domain" | sed 's/[^A-Za-z0-9_.-]/_/g')"
-                dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${attempt}-${mode}.txt"
-                {
-                    printf 'destination: %s\nmode: %s\nattempt: %s\nexit_status: %s\n--- output ---\n' "$destination" "$mode" "$attempt" "$rc"
-                    printf '%s\n' "$output"
-                } > "$dbg_file" 2>/dev/null || true
-            fi
-            parsed=""
-            if [[ -n "$output" ]]; then
-                parsed="$(printf '%s\n' "$output" | parse_mtr_report "$ip_flag" "$target")" || parsed=$'__PARSE_ERROR__\t-\t'
-            fi
-            IFS=$'\t' read -r ip latency path_ips <<< "$parsed"
-            case "$ip" in
-                __HIDDEN__) rank=3 ;;
-                __UNCONFIRMED__) rank=2 ;;
-                __PARSE_ERROR__) rank=1 ;;
-                "") rank=0 ;;
-                *) printf '%s\t%s\t%s' "$ip" "${latency:--}" "$path_ips"; return 0 ;;
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        limit=$MTR_TIMEOUT
+        (( limit > remaining )) && limit=$remaining
+        rc=0
+        output="$(run_mtr_report "$ip_flag" "$destination" "$limit" 2>&1)" || rc=$?
+        if [[ "${EGRESS_DEBUG_MTR:-0}" == "1" ]]; then
+            local dbg_dir dbg_file safe_domain
+            dbg_dir="$CACHE_DIR/mtr-debug"
+            install -d -m 700 "$dbg_dir" 2>/dev/null || true
+            safe_domain="$(printf '%s' "$domain" | sed 's/[^A-Za-z0-9_.-]/_/g')"
+            dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${attempt}-numeric.txt"
+            {
+                printf 'destination: %s\nattempt: %s\nlimit_seconds: %s\nexit_status: %s\n--- output ---\n' "$destination" "$attempt" "$limit" "$rc"
+                printf '%s\n' "$output"
+            } > "$dbg_file" 2>/dev/null || true
+        fi
+        if (( rc == 126 || rc == 127 )); then printf '__MTR_UNAVAILABLE__\t-\t'; return; fi
+        if (( rc != 0 )); then
+            case "${output,,}" in
+                *permission\ denied*|*operation\ not\ permitted*|*unable\ to\ get\ raw\ sockets*|*failure\ to\ open\ ipv4\ sockets*|*failure\ to\ open\ ipv6\ sockets*)
+                    printf '__MTR_UNAVAILABLE__\t-\t'; return ;;
             esac
-            # A failed command is not evidence that the path is hidden.
-            if (( rc != 0 )); then rank=0; parsed=$'__PROBE_FAILED__\t-\t'; fi
-            if (( rank > fallback_rank )); then fallback="$parsed"; fallback_rank=$rank; fi
-        done
-        if (( attempt < MTR_ATTEMPTS )); then sleep "$attempt"; fi
+        fi
+        parsed=""
+        if [[ -n "$output" ]]; then
+            parsed="$(printf '%s\n' "$output" | parse_mtr_report "$ip_flag" "$target")" || parsed=$'__PARSE_ERROR__\t-\t'
+        fi
+        IFS=$'\t' read -r ip latency path_ips <<< "$parsed"
+        case "$ip" in
+            __HIDDEN__)
+                if (( rc == 0 )); then printf '%s' "$parsed"; return; fi ;;
+            __PARSE_ERROR__)
+                if (( rc == 0 )); then printf '%s' "$parsed"; return; fi ;;
+            __UNCONFIRMED__)
+                if (( rc == 0 )); then fallback="$parsed"; fi ;;
+            "") ;;
+            *) printf '%s' "$parsed"; return ;;
+        esac
+        # A non-timeout command error is permanent for this probe. Preserve any
+        # valid route from partial output above, but do not repeat the failure.
+        if (( rc != 0 && rc != 124 )); then break; fi
     done
     printf '%s' "$fallback"
 }
 
+# A separate, bounded direct HTTPS HEAD measures TCP setup time, not ICMP RTT,
+# TLS handshake or server response time. Even a TLS/HTTP error after connecting
+# leaves usable TCP timing. Disable curl config, proxies and redirects so the
+# measurement cannot silently become a proxy/redirect destination measurement.
+tcp_connect_latency() {
+    local ip_flag="$1" domain="$2" timings
+    timings="$(LC_ALL=C timeout -k 1 "$(( ${LATENCY_TIMEOUT:-3} + 1 ))" curl -q -sS "$ip_flag" \
+        --proxy '' --noproxy '*' --connect-timeout "${LATENCY_TIMEOUT:-3}" \
+        --max-time "${LATENCY_TIMEOUT:-3}" --head --output /dev/null \
+        --proto '=https' --write-out '%{time_connect}\t%{time_namelookup}' \
+        "https://${domain}/" 2>/dev/null)" || true
+    printf '%s\n' "$timings" | LC_ALL=C awk '
+        NF==2 && $1 ~ /^[0-9]+([.][0-9]+)?$/ && $2 ~ /^[0-9]+([.][0-9]+)?$/ {
+            if ($1+0>0 && $1+0 >= $2+0) printf "%.1f", ($1-$2)*1000
+        }'
+}
+
+# Keep route evidence independent from latency. Four TSV fields are split with
+# split_tsv4 because Bash whitespace IFS would collapse an empty path field.
+probe_domain() {
+    local ip_flag="$1" domain="$2" result hop latency path_ips unused source=""
+    is_valid_domain "$domain" || { printf '__PROBE_FAILED__\t-\t\t'; return; }
+    result="$(first_public_hop "$ip_flag" "$domain")"
+    split_tsv4 "$result" hop latency path_ips unused
+    if [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        source=mtr
+    else
+        latency="$(tcp_connect_latency "$ip_flag" "$domain")"
+        if [[ -n "$latency" ]]; then source=tcp_connect; else latency="-"; fi
+    fi
+    printf '%s\t%s\t%s\t%s' "$hop" "$latency" "$path_ips" "$source"
+}
 
 detect_mtr_base_asn() {
     local ip_flag="$1" prefix="$2" hop_line hop latency path_ips data asn isp country info
     hop_line="$(first_public_hop "$ip_flag" "$MTR_BASE_DOMAIN" || true)"
     IFS=$'\t' read -r hop latency path_ips <<< "$hop_line"
+    if [[ "$hop" == "__MTR_UNAVAILABLE__" ]]; then
+        if [[ "${MTR_AVAILABLE:-1}" == 1 ]]; then
+            err "MTR 无法运行，将仅检测 TCP 443 连接延迟（无法判断路径分流）"
+        fi
+        printf -v "${prefix}_MTR_AVAILABLE" '%s' 0
+    fi
     [[ -n "$hop" && "$hop" != __* ]] || return 1
     data="$(lookup_ip "$hop" || true)"
     split_lookup_data "$data" asn isp country
@@ -926,9 +985,11 @@ print_result_row() {
     if [[ -z "$asn" ]]; then asn_isp="$isp"; else asn_isp="AS${asn} ${isp}"; fi
     if [[ "$is_split" == "1" ]]; then
         latency_disp="$(printf '%s%s%s' "$YELLOW" "$(format_latency_text "$latency")" "$R")"
+        [[ "${9:-}" == tcp_connect ]] && latency_disp+=" TCP"
         printf "      %b  %s%-24s  %-15s  %b  %s%-3s  %-34s  ⮜ 分流%s\n" "$marker" "$YELLOW" "$domain" "$ip" "$latency_disp" "$YELLOW" "$cc" "${asn_isp:0:34}" "$R"
     else
         latency_disp="$(format_latency "$latency")"
+        [[ "${9:-}" == tcp_connect ]] && latency_disp+=" TCP"
         printf "      %b  %-24s  %-15s  %b  %-3s  %s%s%s\n" "$marker" "$domain" "$ip" "$latency_disp" "$cc" "$DIM" "${asn_isp:0:34}" "$R"
     fi
 }
@@ -958,7 +1019,7 @@ run_mtr_group() {
     fi
     for idx in "${idxs[@]}"; do
         {
-            local hop; hop="$(first_public_hop "$ip_flag" "${DOMAINS[$idx]}")"
+            local hop; hop="$(probe_domain "$ip_flag" "${DOMAINS[$idx]}")"
             printf '%s' "$hop" > "$out_dir/$idx"
         } &
         mtr_pids+=($!)
@@ -994,7 +1055,7 @@ run_check_pass() {
             fi
             ;;
     esac
-    eval "${prefix}_OK=0"; eval "${prefix}_DOWN=0"; eval "${prefix}_HIDDEN=0"
+    eval "${prefix}_OK=0"; eval "${prefix}_DOWN=0"; eval "${prefix}_HIDDEN=0"; eval "${prefix}_PARTIAL=0"
     local SPLIT_COLORS=( "$YELLOW" "$MAGENTA" "$RED" "$CYAN" )
     local split_color_n=4
     print_pass_header "$label"
@@ -1024,30 +1085,40 @@ run_check_pass() {
         local idx
         for idx in "${gidxs[@]}"; do
         local cat_v="$cat" domain="${DOMAINS[$idx]}" note="${NOTES[$idx]}"
-        local hop_line hop latency path_ips
+        local hop_line hop latency path_ips latency_source
         hop_line="$(cat "$out_dir/$idx" 2>/dev/null || true)"
-        IFS=$'\t' read -r hop latency path_ips <<< "$hop_line"
+        split_tsv4 "$hop_line" hop latency path_ips latency_source
         latency="${latency:-"-"}"
+        if [[ -z "$latency_source" && "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then latency_source=mtr; fi
         if [[ "$hop" == "__HIDDEN__" ]]; then
             eval "${prefix}_HIDDEN=\$((${prefix}_HIDDEN+1))"
             [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$SYM_SKIP" "$domain" "-" "$latency" "-" "" "路径隐藏 / 仅目标可见" 0
             [[ $first_json -eq 0 ]] && printf ',\n' >> "$tmp_file"; first_json=0
             local latency_json="null"; [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]] && latency_json="$latency"
-            jq -n --arg c "$cat_v" --arg d "$domain" --argjson lat "$latency_json" --arg note "$note" \
-                '{category:$c, domain:$d, status:"hidden", first_hop:null, latency_ms:$lat, path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:($note + " 路径隐藏 / 仅目标可见")}' >> "$tmp_file"
+            jq -n --arg c "$cat_v" --arg d "$domain" --argjson lat "$latency_json" --arg source "$latency_source" --arg note "$note" \
+                '{category:$c, domain:$d, status:"hidden", first_hop:null, latency_ms:$lat, latency_source:($source | if . == "" then null else . end), latency_port:(if $source == "tcp_connect" then 443 else null end), path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:($note + " 路径隐藏 / 仅目标可见")}' >> "$tmp_file"
             continue
         fi
         if [[ -z "$hop" || "$hop" == __* ]]; then
-            local reason="probe_failed" failure_text="探测失败"
+            local reason="probe_failed" failure_text="探测失败" result_status="down"
+            local latency_json="null" marker="$SYM_DOWN"
             case "$hop" in
+                __MTR_UNAVAILABLE__) reason="mtr_unavailable"; failure_text="MTR 不可用" ;;
                 __PARSE_ERROR__) reason="parse_error"; failure_text="MTR 报告解析失败" ;;
                 __UNCONFIRMED__) reason="no_public_hop"; failure_text="未发现公网中间跳 / 目标回应未确认" ;;
             esac
-            eval "${prefix}_DOWN=\$((${prefix}_DOWN+1))"
-            [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$SYM_DOWN" "$domain" "-" "-" "-" "" "$failure_text" 0
+            if [[ "$latency_source" == tcp_connect && "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                result_status="partial"; latency_json="$latency"; marker="$SYM_SKIP"
+                failure_text+=" / 仅连接延迟，路径不可用"
+                eval "${prefix}_PARTIAL=\$((${prefix}_PARTIAL+1))"
+            else
+                eval "${prefix}_DOWN=\$((${prefix}_DOWN+1))"
+            fi
+            [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$marker" "$domain" "-" "$latency" "-" "" "$failure_text" 0 "$latency_source"
             [[ $first_json -eq 0 ]] && printf ',\n' >> "$tmp_file"; first_json=0
             jq -n --arg c "$cat_v" --arg d "$domain" --arg note "$note" --arg reason "$reason" \
-                '{category:$c, domain:$d, status:"down", reason:$reason, first_hop:null, latency_ms:null, path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:$note}' >> "$tmp_file"
+                --arg status "$result_status" --argjson lat "$latency_json" --arg source "$latency_source" \
+                '{category:$c, domain:$d, status:$status, reason:$reason, first_hop:null, latency_ms:$lat, latency_source:($source | if . == "" then null else . end), latency_port:(if $source == "tcp_connect" then 443 else null end), path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:$note}' >> "$tmp_file"
             continue
         fi
         local data asn isp country
@@ -1085,16 +1156,16 @@ run_check_pass() {
         fi
         local marker
         if [[ $is_split -eq 1 ]]; then marker="${SPLIT_COLORS[${route_scidx[$key]} % split_color_n]}●${R}"; else marker="${GREEN}●${R}"; fi
-        [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$marker" "$domain" "$hop" "$latency" "$country" "$asn" "$isp" "$is_split"
+        [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$marker" "$domain" "$hop" "$latency" "$country" "$asn" "$isp" "$is_split" "$latency_source"
         [[ $first_json -eq 0 ]] && printf ',\n' >> "$tmp_file"; first_json=0
         local split_json="false"; [[ $is_split -eq 1 ]] && split_json="true"
         local latency_json="null"; [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]] && latency_json="$latency"
         if [[ -z "$asn" ]]; then
-            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$hop" --argjson lat "$latency_json" --arg chain "$path_chain" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
-                '{category:$c, domain:$d, status:"ok", first_hop:$h, latency_ms:$lat, path_asn_chain:($chain | if . == "" then null else . end), asn:null, isp:$isp, country:$cc, split:$sp, note:$note}' >> "$tmp_file"
+            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$hop" --argjson lat "$latency_json" --arg source "$latency_source" --arg chain "$path_chain" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
+                '{category:$c, domain:$d, status:"ok", first_hop:$h, latency_ms:$lat, latency_source:($source | if . == "" then null else . end), latency_port:(if $source == "tcp_connect" then 443 else null end), path_asn_chain:($chain | if . == "" then null else . end), asn:null, isp:$isp, country:$cc, split:$sp, note:$note}' >> "$tmp_file"
         else
-            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$hop" --argjson lat "$latency_json" --arg chain "$path_chain" --arg asn "$asn" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
-                '{category:$c, domain:$d, status:"ok", first_hop:$h, latency_ms:$lat, path_asn_chain:($chain | if . == "" then null else . end), asn:("AS"+$asn), isp:$isp, country:$cc, split:$sp, note:$note}' >> "$tmp_file"
+            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$hop" --argjson lat "$latency_json" --arg source "$latency_source" --arg chain "$path_chain" --arg asn "$asn" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
+                '{category:$c, domain:$d, status:"ok", first_hop:$h, latency_ms:$lat, latency_source:($source | if . == "" then null else . end), latency_port:(if $source == "tcp_connect" then 443 else null end), path_asn_chain:($chain | if . == "" then null else . end), asn:("AS"+$asn), isp:$isp, country:$cc, split:$sp, note:$note}' >> "$tmp_file"
         fi
         done
     done
@@ -1137,7 +1208,7 @@ run_check_pass() {
         if [[ $split_idx -ge 1 ]]; then
             printf "  %s%s %s检测到分流: %d 条非默认线路, %d 个域名被分流到其他出口%s\n" "$BOLD" "$SYM_WARN" "$YELLOW" "$split_idx" "$split_domain_count" "$R"
         else
-            printf "  %s%s %s所有域名走同一出口 (AS%s) — 未检测到分流%s\n" "$BOLD" "$SYM_INFO" "$GREEN" "${effective_base_asn:-?}" "$R"
+            printf "  %s%s %s已识别路径的域名走同一出口 (AS%s) — 未检测到分流%s\n" "$BOLD" "$SYM_INFO" "$GREEN" "${effective_base_asn:-?}" "$R"
         fi
 
         if [[ ${#path_order[@]} -gt 0 ]]; then
@@ -1171,6 +1242,7 @@ START_EPOCH=$(date +%s)
 START_TS="$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
 _raw_host="$(hostname 2>/dev/null || printf 'unknown')"
 HOST_NAME="$(printf '%s' "$_raw_host" | LC_ALL=C tr -d '\000-\037\177')"; unset _raw_host
+V4_PARTIAL=0; V6_PARTIAL=0
 V4_OK=0; V4_DOWN=0; V4_HIDDEN=0; V4_ROUTE_COUNT=0; V6_OK=0; V6_DOWN=0; V6_HIDDEN=0; V6_ROUTE_COUNT=0
 V4_PASS_RAN=0; V6_PASS_RAN=0; V4_ECHO_UNIQUE=0; V6_ECHO_UNIQUE=0
 V4_ECHO_DETAIL=""; V6_ECHO_DETAIL=""; DEFAULT_EGRESS="none"
@@ -1238,10 +1310,10 @@ END_EPOCH=$(date +%s); ELAPSED=$((END_EPOCH - START_EPOCH)); ELAPSED_STR="$(form
 if [[ $OUTPUT_JSON -eq 0 ]]; then
     printf "\n"; rule_double 72
     if [[ $V4_PASS_RAN -eq 1 ]]; then
-        printf "  IPv4:  %s%d 域名%s   %s%d 条线路%s   %s%d 域名分流%s   %s%d 路径隐藏%s   %s%d 探测失败%s\n" "$GREEN" "$V4_OK" "$R" "$CYAN" "$V4_ROUTE_COUNT" "$R" "$YELLOW" "$V4_SPLIT_DOMAINS" "$R" "$GRAY" "$V4_HIDDEN" "$R" "$RED" "$V4_DOWN" "$R"
+        printf "  IPv4:  %s%d 域名%s   %s%d 条线路%s   %s%d 域名分流%s   %s%d 路径隐藏%s   %s%d 仅延迟%s   %s%d 探测失败%s\n" "$GREEN" "$V4_OK" "$R" "$CYAN" "$V4_ROUTE_COUNT" "$R" "$YELLOW" "$V4_SPLIT_DOMAINS" "$R" "$GRAY" "$V4_HIDDEN" "$R" "$YELLOW" "$V4_PARTIAL" "$R" "$RED" "$V4_DOWN" "$R"
     else printf "  IPv4:  %s skipped\n" "$SYM_SKIP"; fi
     if [[ $V6_PASS_RAN -eq 1 ]]; then
-        printf "  IPv6:  %s%d 域名%s   %s%d 条线路%s   %s%d 域名分流%s   %s%d 路径隐藏%s   %s%d 探测失败%s\n" "$GREEN" "$V6_OK" "$R" "$CYAN" "$V6_ROUTE_COUNT" "$R" "$YELLOW" "$V6_SPLIT_DOMAINS" "$R" "$GRAY" "$V6_HIDDEN" "$R" "$RED" "$V6_DOWN" "$R"
+        printf "  IPv6:  %s%d 域名%s   %s%d 条线路%s   %s%d 域名分流%s   %s%d 路径隐藏%s   %s%d 仅延迟%s   %s%d 探测失败%s\n" "$GREEN" "$V6_OK" "$R" "$CYAN" "$V6_ROUTE_COUNT" "$R" "$YELLOW" "$V6_SPLIT_DOMAINS" "$R" "$GRAY" "$V6_HIDDEN" "$R" "$YELLOW" "$V6_PARTIAL" "$R" "$RED" "$V6_DOWN" "$R"
     else printf "  IPv6:  %s skipped  %s%s%s\n" "$SYM_SKIP" "$DIM" "${V6_SKIP_REASON:-}" "$R"; fi
     printf "  %selapsed:%s %s\n" "$DIM" "$R" "$ELAPSED_STR"; rule_double 72
 fi
@@ -1249,11 +1321,13 @@ FINAL_JSON="$(mktemp "$CACHE_DIR/.tmp-final.XXXXXXXX")"; chmod 600 "$FINAL_JSON"
 build_pass_obj() {
     local prefix="$1" ran="$2" tmp_file="$3" skip_reason="$4"
     if [[ "$ran" == "1" ]]; then
-        local ok down hidden routes
-        eval "ok=\${${prefix}_OK}"; eval "down=\${${prefix}_DOWN}"; eval "hidden=\${${prefix}_HIDDEN}"; eval "routes=\${${prefix}_ROUTE_COUNT}"
-        local split="false"; [[ $routes -ge 2 ]] && split="true"
-        jq -n --argjson ok "$ok" --argjson dn "$down" --argjson hidden "$hidden" --argjson rc "$routes" --argjson split "$split" --slurpfile r "$tmp_file" \
-            '{available:true, summary:{total:($ok+$hidden+$dn), ok:$ok, hidden:$hidden, down:$dn}, route_count:$rc, split_routing_detected:$split, results:$r[0]}'
+        local ok down hidden partial routes
+        eval "ok=\${${prefix}_OK}"; eval "down=\${${prefix}_DOWN}"; eval "hidden=\${${prefix}_HIDDEN}"; eval "partial=\${${prefix}_PARTIAL}"; eval "routes=\${${prefix}_ROUTE_COUNT}"
+        local split="null"
+        if [[ $routes -ge 2 ]]; then split="true"
+        elif [[ $ok -gt 0 && $hidden -eq 0 && $down -eq 0 && $partial -eq 0 ]]; then split="false"; fi
+        jq -n --argjson ok "$ok" --argjson dn "$down" --argjson hidden "$hidden" --argjson partial "$partial" --argjson rc "$routes" --argjson split "$split" --slurpfile r "$tmp_file" \
+            '{available:true, summary:{total:($ok+$hidden+$partial+$dn), ok:$ok, hidden:$hidden, partial:$partial, down:$dn}, route_count:$rc, split_routing_detected:$split, results:$r[0]}'
     else
         jq -n --arg reason "$skip_reason" '{available:false, summary:null, route_count:0, split_routing_detected:false, results:null, reason:$reason}'
     fi
@@ -1274,7 +1348,7 @@ jq -n --arg ts "$START_TS" --arg host "$HOST_NAME" --arg ver "$VERSION" --arg de
 LAST_JSON="$CACHE_DIR/last.json"
 if mv -f -- "$FINAL_JSON" "$LAST_JSON" 2>/dev/null; then chmod 600 "$LAST_JSON" 2>/dev/null || true; FINAL_JSON=""
 else err "保存 last.json 失败"; fi
-TOTAL_DOWN=$((V4_DOWN + V6_DOWN))
+TOTAL_DOWN=$((V4_DOWN + V6_DOWN + V4_PARTIAL + V6_PARTIAL))
 [[ $V4_PASS_RAN -eq 0 && $V6_PASS_RAN -eq 0 ]] && exit 2
 [[ $TOTAL_DOWN -gt 0 ]] && exit 2
 exit 0
