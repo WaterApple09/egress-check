@@ -792,11 +792,11 @@ first_public_hop() {
                 printf '%s\n' "$output"
             } > "$dbg_file" 2>/dev/null || true
         fi
-        if (( rc == 126 || rc == 127 )); then printf '__MTR_UNAVAILABLE__\t-\t'; return; fi
+        if (( rc == 126 || rc == 127 )); then printf '__MTR_UNAVAILABLE__\t%s\t' "${known_latency:--}"; return; fi
         if (( rc != 0 )); then
             case "${output,,}" in
                 *permission\ denied*|*operation\ not\ permitted*|*unable\ to\ get\ raw\ sockets*|*failure\ to\ open\ ipv4\ sockets*|*failure\ to\ open\ ipv6\ sockets*)
-                    printf '__MTR_UNAVAILABLE__\t-\t'; return ;;
+                    printf '__MTR_UNAVAILABLE__\t%s\t' "${known_latency:--}"; return ;;
             esac
         fi
         parsed=""
@@ -816,7 +816,9 @@ first_public_hop() {
                 printf '%s' "$parsed"; return ;;
             __PARSE_ERROR__)
                 # Keep confirmed RTT even if the report was cut off by timeout.
-                if [[ "$latency" != - || "$fallback" != __PARSE_ERROR__* ]]; then fallback="$parsed"; fi
+                if (( rc == 0 )) || [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                    fallback="$parsed"
+                fi
                 if (( rc == 0 )); then
                     if (( format_retry == 0 )); then mode=compat; format_retry=1; continue; fi
                     break

@@ -564,6 +564,8 @@ esac
         self.assertEqual(self.parse(data), ['__PARSE_ERROR__', '8.5', ''])
         self.assertEqual(self.probe([data, 'bad report']), ['__PARSE_ERROR__\t8.5\t', '2'])
         self.assertEqual(self.probe([data, report('???')]), ['__PARSE_ERROR__\t8.5\t', '2'])
+        self.assertEqual(self.probe([data, 'mtr: Operation not permitted'], [0, 1]),
+                         ['__MTR_UNAVAILABLE__\t8.5\t', '2'])
 
     def test_compatibility_report_can_recover(self):
         result = self.probe(['bad report', report(row('router (168.95.98.254)'), row('target (104.18.33.45)'))])
