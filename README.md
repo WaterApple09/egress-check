@@ -58,8 +58,22 @@ bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.s
 - 能使用 `getent ahostsv4/ahostsv6` 时，先选取一个目标地址并对该地址探测，避免域名多地址或 DNS 变化导致目标判断不一致。没有可用解析结果时仍探测域名，但保守排除最后一个响应地址，不将其直接认定为公网中间跳。
 - 只有确认目标地址实际回应、且没有可见公网中间跳时，才显示「路径隐藏 / 仅目标可见」。目标延迟也只取已确认目标的响应；无法确认时为 `-` / JSON `null`。
 - 解析失败、探测失败、没有可见公网中间跳分别显示原因。JSON 保留 `ok` / `hidden` / `down` 状态，并为 `down` 增加 `reason`：`parse_error`、`probe_failed` 或 `no_public_hop`。`down` 仍计入失败统计并导致退出码 2。
-- 不完整结果继续尝试数值地址模式、主机名加地址模式及后续重试；优先返回可见公网路径。若始终没有更完整路径，保留已确认的目标回应。
-- `EGRESS_DEBUG_MTR=1` 的日志按尝试次数和模式分别保存，包含探测地址、退出状态和错误输出。超时返回的有效中间跳仍可用于路径观察。
+- MTR 始终使用数值地址模式，避免反向 DNS 等待；已确认的公网路径或「仅目标可见」立即返回。明确的格式、权限或命令错误不重复探测；未确认结果默认最多探测两次。
+- `MTR_TOTAL_TIMEOUT` 默认 12 秒，共享于目标解析及所有 MTR 尝试，`MTR_TIMEOUT` 仍控制单次上限。目标预解析最多占用 3 秒；超时终止另有最多 1 秒的强制结束宽限，不再按轮次额外休眠。
+- `EGRESS_DEBUG_MTR=1` 的日志按尝试次数保存，包含探测地址、单次时间限制、退出状态和错误输出。超时返回的有效中间跳仍可用于路径观察。
+
+### MTR 不可用时保留连接延迟
+
+MTR 未安装、权限不足、报告解析失败或没有确认目标延迟时，脚本使用 curl 测量目标的 **TCP 443 连接建立耗时**。MTR 成为可选依赖，不再为安装它阻塞检测；原有 jq 等依赖仍需可用。确认某地址族的 MTR 权限异常后，本轮该地址族后续域名直接测连接延迟。
+
+- 从 curl 的 `time_connect` 中扣除 `time_namelookup`，不将 DNS、TLS 握手和服务器响应耗时计入连接延迟。即使 TCP 连接后的 TLS/HTTP 步骤失败，仍保留已取得的 TCP 测量值。
+- 测量使用请求指定的 IPv4/IPv6，禁用代理、curl 配置文件和重定向；独立解析该域名，CDN 场景中可能连接到不同于 MTR 的地址。
+- 单次请求默认 `LATENCY_TIMEOUT=3` 秒；外层守护多留 1 秒以收集 curl 超时后的计时输出，并有 1 秒强制结束宽限。TCP 未连接成功时显示未知，不伪造为 `0ms`。
+- 终端在数值后标记 `TCP`；JSON 新增 `latency_source`（`mtr` / `tcp_connect` / `null`）和 `latency_port`（TCP 为 443，否则为 `null`）。TCP 建连耗时不等同于 MTR RTT，也不代表 TLS/HTTP 服务可用。
+- 有连接延迟但没有路径证据时，JSON 为 `status:"partial"`，保留路径失败 `reason`（新增 `mtr_unavailable`），ASN、首跳和分流结论保持 `null`。汇总单列 `partial` /「仅延迟」，不计入 `down`；路径和连接都失败才计入 `down`。
+- 退出码 2 表示仍有路径探测不完整，包括 `partial`，不意味着该域名的 TCP 连接失败。已有 MTR 路径但缺少目标延迟时，也可补充 TCP 延迟，同时保留路径结果。
+
+例如：`MTR_TOTAL_TIMEOUT=8 LATENCY_TIMEOUT=2 bash ip.sh -4` 可进一步缩短每个域名的探测等待。ASN 查询、出口检测及显示不包含在 MTR 时间预算中。
 
 离线回归测试不发送探测流量：
 
