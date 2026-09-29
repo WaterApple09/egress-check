@@ -157,7 +157,7 @@ class MtrTests(unittest.TestCase):
         data = report(*(row(ip) for ip in ('::', '::1', 'fe80::1', 'febf::1', 'fc00::1', 'fd00::1', 'ff02::1', '2606:4700::1111')))
         self.assertEqual(self.parse(data, target='2606:4700::1111', family='-6')[0], '__HIDDEN__')
 
-    def probe(self, outputs, statuses=None):
+    def probe(self, outputs, statuses=None, attempts=2):
         statuses = statuses or [0] * len(outputs)
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -174,28 +174,26 @@ run_mtr_report() {
     cat "$D/$n.txt"
     return "$(cat "$D/$n.rc")"
 }
-MTR_ATTEMPTS=2
 first_public_hop -4 example.com
 printf '\\n'
 cat "$D/calls"
 '''
-            result = self.shell('D=' + shlex.quote(tmp) + '\n' + body)
+            result = self.shell('D=' + shlex.quote(tmp) + '\nMTR_ATTEMPTS=' + str(attempts) + '\n' + body)
             return result.splitlines()
 
-    def test_parse_error_stops_immediately(self):
-        self.assertEqual(self.probe(['bad report']), ['__PARSE_ERROR__\t-\t', '1'])
+    def test_parse_error_gets_one_compatibility_attempt(self):
+        self.assertEqual(self.probe(['bad report'] * 2), ['__PARSE_ERROR__\t-\t', '2'])
 
     def test_hidden_stops_immediately(self):
         self.assertEqual(self.probe([report(row('104.18.33.45'))]), ['__HIDDEN__\t9.0\t', '1'])
 
-    def test_unconfirmed_can_retry_once(self):
+    def test_unconfirmed_does_not_retry(self):
         result = self.probe([report(row('???', loss='100')), report(row('168.95.98.254'), row('104.18.33.45'))])
-        self.assertTrue(result[0].startswith('168.95.98.254\t9.0'))
-        self.assertEqual(result[1], '2')
+        self.assertEqual(result, ['__UNCONFIRMED__\t-\t', '1'])
 
-    def test_command_failure_never_hidden(self):
+    def test_timeout_preserves_confirmed_target_reply(self):
         result = self.probe([report(row('104.18.33.45'))] * 2, [124] * 2)
-        self.assertEqual(result, ['__PROBE_FAILED__\t-\t', '2'])
+        self.assertEqual(result, ['__HIDDEN__\t9.0\t', '1'])
 
     def test_command_failure_stops_immediately(self):
         result = self.probe(['mtr failed'], [1])
@@ -206,7 +204,7 @@ cat "$D/calls"
         self.assertEqual(result, ['__MTR_UNAVAILABLE__\t-\t', '1'])
 
     def test_no_response_retained(self):
-        self.assertEqual(self.probe([report(row('???', loss='100'))] * 2), ['__UNCONFIRMED__\t-\t', '2'])
+        self.assertEqual(self.probe([report(row('???', loss='100'))] * 2), ['__UNCONFIRMED__\t-\t', '1'])
 
     def test_markers_never_sent_to_asn_lookup(self):
         for marker in ('__HIDDEN__', '__PARSE_ERROR__', '__UNCONFIRMED__', '__PROBE_FAILED__'):
@@ -246,6 +244,8 @@ printf '%s\\n%s' "$rc" "$out"
         result = self.shell(body)
         self.assertTrue(result.startswith('7\n'))
         self.assertIn('-n', result)
+        self.assertIn('-w', result)
+        self.assertIn('-o L S N A B W V', result)
         self.assertNotIn('-b', result)
         self.assertIn('104.18.33.45', result)
         self.assertIn('mtr_error', result)
@@ -456,6 +456,7 @@ first_public_hop -4 example.com
             ('missing', '', 0, 'partial', 'mtr_unavailable', '50.0', 0),
             ('permission', 'mtr: Operation not permitted', 1, 'partial', 'mtr_unavailable', '50.0', 60),
             ('parse', 'bad report', 0, 'partial', 'parse_error', '50.0', 0),
+            ('parse_with_rtt', report('bad row', row('104.18.33.45')), 0, 'partial', 'parse_error', '9.0', 0),
             ('hidden_path', report(row('???', loss='100')), 0, 'partial', 'no_public_hop', '50.0', 0),
             ('command', 'mtr: failed', 1, 'partial', 'probe_failed', '50.0', 0),
             ('no_target_reply', report(row('168.95.98.254'), row('???', loss='100')), 0, 'ok', None, '50.0', 0),
@@ -502,14 +503,15 @@ esac
                                MTR_ATTEMPTS='2', MTR_CONCURRENCY='2')
                     args = ['bash', str(ROOT / 'ip.sh'), '-4', '--json' if output_json else '--no-color']
                     result = subprocess.run(args, text=True, capture_output=True, env=env, timeout=20)
-                    self.assertEqual(result.returncode, 0 if status == 'ok' else 2, result.stderr)
+                    self.assertEqual(result.returncode, 2 if status == 'down' else 0, result.stderr)
                     data = json.loads((directory / 'cache' / 'last.json').read_text())
                     for item in data['ipv4']['results']:
                         self.assertEqual(item['status'], status)
                         self.assertEqual(item.get('reason'), reason)
                         self.assertEqual(item['latency_ms'], float(latency) if latency else None)
-                        self.assertEqual(item['latency_source'], 'tcp_connect' if latency else None)
-                        self.assertEqual(item['latency_port'], 443 if latency else None)
+                        source = 'mtr' if mode == 'parse_with_rtt' else 'tcp_connect' if latency else None
+                        self.assertEqual(item['latency_source'], source)
+                        self.assertEqual(item['latency_port'], 443 if source == 'tcp_connect' else None)
                         if status != 'ok':
                             self.assertIsNone(item['first_hop'])
                             self.assertIsNone(item['asn'])
@@ -519,17 +521,134 @@ esac
                     self.assertEqual(summary['total'], 2)
                     if status != 'ok':
                         self.assertIsNone(data['ipv4']['split_routing_detected'])
-                    self.assertEqual(len((directory / 'tcp-calls').read_text().splitlines()), 2)
+                    if mode == 'parse_with_rtt':
+                        self.assertFalse((directory / 'tcp-calls').exists())
+                    else:
+                        self.assertEqual(len((directory / 'tcp-calls').read_text().splitlines()), 2)
                     if mode == 'missing':
                         self.assertFalse((directory / 'mtr-calls').exists())
                     if mode == 'permission':
                         self.assertEqual(len((directory / 'mtr-calls').read_text().splitlines()), 1)
                     if output_json:
                         self.assertEqual(json.loads(result.stdout), data)
+                    elif mode == 'parse_with_rtt':
+                        self.assertIn('仅目标延迟，路径不可用', result.stdout)
+                        self.assertIn('9.0ms', result.stdout)
                     elif latency:
                         self.assertIn('50.0ms TCP', result.stdout)
                         if status == 'partial':
                             self.assertIn('仅连接延迟，路径不可用', result.stdout)
+
+
+    def test_waiting_records_without_statistics(self):
+        for placeholder in ('(waiting for reply)', '???', '*'):
+            with self.subTest(placeholder=placeholder):
+                self.assertEqual(self.parse(report(placeholder, row('104.18.33.45'))),
+                                 ['__HIDDEN__', '9.0', ''])
+                self.assertEqual(self.parse(report(placeholder))[0], '__UNCONFIRMED__')
+
+    def test_reordered_header_columns(self):
+        data = ('HOST: source Avg Snt Loss%\n'
+                '1. router.example (168.95.98.254) 1.2 3 0.0%\n'
+                '2. 104.18.33.45 8.5 3 0.0%\n')
+        self.assertEqual(self.parse(data), ['168.95.98.254', '8.5', '168.95.98.254'])
+
+    def test_long_ipv6_and_asn_prefix(self):
+        target = '2606:4700:1234:5678:9abc:def0:1234:5678'
+        data = report(row('AS123 2001:4860:1234:5678:9abc:def0:1234:5678'), row(target))
+        self.assertEqual(self.parse(data, target, '-6')[0:2],
+                         ['2001:4860:1234:5678:9abc:def0:1234:5678', '9.0'])
+
+    def test_bad_hop_keeps_confirmed_target_timing(self):
+        data = report('broken row', row('104.18.33.45', avg='8.5'))
+        self.assertEqual(self.parse(data), ['__PARSE_ERROR__', '8.5', ''])
+        self.assertEqual(self.probe([data, 'bad report']), ['__PARSE_ERROR__\t8.5\t', '2'])
+        self.assertEqual(self.probe([data, report('???')]), ['__PARSE_ERROR__\t8.5\t', '2'])
+        self.assertEqual(self.probe([data, 'mtr: Operation not permitted'], [0, 1]),
+                         ['__MTR_UNAVAILABLE__\t8.5\t', '2'])
+
+    def test_compatibility_report_can_recover(self):
+        result = self.probe(['bad report', report(row('router (168.95.98.254)'), row('target (104.18.33.45)'))])
+        self.assertEqual(result, ['168.95.98.254\t9.0\t168.95.98.254', '2'])
+
+    def test_compatibility_timeout_never_repeats(self):
+        self.assertEqual(self.probe(['bad report', ''], [0, 124], attempts=8),
+                         ['__PARSE_ERROR__\t-\t', '2'])
+
+    def test_empty_report_gets_only_one_compatibility_attempt(self):
+        self.assertEqual(self.probe(['', ''], attempts=8), ['__PARSE_ERROR__\t-\t', '2'])
+
+    def test_compatibility_uses_name_and_address_mode(self):
+        body = r"""
+nice() { shift 2; "$@"; }
+timeout() { shift 3; "$@"; }
+mtr() { printf '%s\n' "$*"; }
+MTR_NICE=0 MTR_COUNT=3 MTR_MAXTTL=30
+run_mtr_report -4 104.18.33.45 1 compat
+"""
+        result = self.shell(body)
+        self.assertIn('-b', result)
+        self.assertIn('-w', result)
+        self.assertNotIn('-n', result)
+
+    def test_format_fallback_shares_total_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / 'mtr'
+            executable.write_text('#!/bin/sh\ncase "$*" in *-b*) sleep 30;; *) echo bad_report;; esac\n')
+            executable.chmod(0o755)
+            body = 'PATH=' + shlex.quote(tmp) + ':"$PATH"\n' + r"""
+resolve_mtr_target() { printf 104.18.33.45; }
+MTR_NICE=0 MTR_COUNT=3 MTR_MAXTTL=30 MTR_ATTEMPTS=8 MTR_TOTAL_TIMEOUT=1
+first_public_hop -4 example.com
+"""
+            started = time.monotonic()
+            self.assertEqual(self.shell(body), '__PARSE_ERROR__\t-\t')
+            self.assertLess(time.monotonic() - started, 4)
+
+    def test_timeout_keeps_partial_report_target_timing(self):
+        data = report('bad row', row('104.18.33.45', avg='8.5'))
+        self.assertEqual(self.probe([data, ''], [124, 124]), ['__PARSE_ERROR__\t8.5\t', '2'])
+
+    def test_recovered_route_keeps_previous_target_timing(self):
+        data = report('bad row', row('104.18.33.45', avg='8.5'))
+        self.assertEqual(self.probe([data, report(row('168.95.98.254'))]),
+                         ['168.95.98.254\t8.5\t168.95.98.254', '2'])
+
+    def test_parse_diagnostic_identifies_first_bad_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'parse.txt')
+            data = report('bad row', 'another bad row', row('104.18.33.45'))
+            self.shell('parse_mtr_report -4 104.18.33.45 ' + shlex.quote(path), data)
+            diagnostic = Path(path).read_text()
+            self.assertIn('parse_reason: missing header or statistics', diagnostic)
+            self.assertIn('1.|-- bad row', diagnostic)
+            self.assertNotIn('another bad row', diagnostic)
+
+    def test_confirmed_mtr_latency_skips_tcp_after_parse_failure(self):
+        body = r"""
+first_public_hop() { printf '__PARSE_ERROR__\t8.5\t'; }
+tcp_connect_latency() { echo unexpected >&2; exit 99; }
+probe_domain -4 example.com
+"""
+        self.assertEqual(self.shell(body), '__PARSE_ERROR__\t8.5\t\tmtr')
+
+    @unittest.skipUnless(os.environ.get('EGRESS_TEST_REAL_MTR') == '1', 'CI opt-in: real loopback MTR')
+    def test_real_mtr_loopback_report(self):
+        command = ['mtr', '-4', '-r', '-w', '-n', '-c', '1', '-G', '1', '-o', 'L S N A B W V', '127.0.0.1']
+        if os.geteuid() != 0:
+            command = ['sudo', '-n'] + command
+        result = subprocess.run(command, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = self.parse(result.stdout, '127.0.0.1')
+        self.assertEqual(parsed[0], '__HIDDEN__', result.stdout)
+        self.assertGreaterEqual(float(parsed[1]), 0)
+
+    def test_release_version_and_executable_links(self):
+        readme = (ROOT / 'README.md').read_text()
+        self.assertIn('VERSION="2.19"', SOURCE)
+        self.assertIn('## v2.19 修复', readme)
+        self.assertNotIn('raw.githubusercontent.com/AIFansX/', readme)
+        self.assertNotIn('git clone https://github.com/AIFansX/', readme)
 
 
 if __name__ == '__main__':

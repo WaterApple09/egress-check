@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 家宽VPS分流一键自查检测 Egress-Check v2.18      鸣谢：https://ip.net.coffee
+# 家宽VPS分流一键自查检测 Egress-Check v2.19      鸣谢：https://ip.net.coffee
 #
 # 用 mtr 取每个域名的"第一个公网跳", 按 ASN 自动分组上色, 直接可视化线路分流.
 # 不同 ASN = 不同出口线路 = 商家做了分流. 一眼看出分了几条线, 哪些域名走哪条.
@@ -11,14 +11,14 @@
 #   3. IPv6 线路分流检测 (不可用则跳过)
 #
 # 以默认出口 ASN 为基准: 相同=未分流(绿), 不同=分流(高亮告警).
-# 退出码: 0=成功  1=配置/依赖错误  2=有域名路径探测不完整（可能仍有连接延迟）
+# 退出码: 0=成功  1=配置/依赖错误  2=存在无可用路径及延迟的域名，或无可检测地址族
 #
 # 环境变量: MTR_CONCURRENCY(组内并发数,默认6)  EGRESS_RULES  EGRESS_CACHE  IP_LOOKUP_CACHE_TTL
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
-VERSION="2.18"
+VERSION="2.19"
 BRAND_URL="https://ip.net.coffee"
 
 # ─── 颜色 ──────────────────────────────────────────────────────────────────
@@ -378,7 +378,7 @@ done
 MTR_AVAILABLE=1
 if ! command -v mtr >/dev/null 2>&1; then
     MTR_AVAILABLE=0
-    err "mtr 未安装，将仅检测 TCP 443 连接延迟（无法判断路径分流）"
+    printf '[*] mtr 未安装，将显示 TCP 443 连接延迟；路径信息不可用\n' >&2
 fi
 
 USE_EMBEDDED_RULES=0
@@ -401,6 +401,11 @@ if ! install -d -m 700 "$IP_LOOKUP_CACHE_DIR" 2>/dev/null; then
     err "无法创建/访问 IP 反查缓存目录: $IP_LOOKUP_CACHE_DIR"; exit 1
 fi
 [[ -O "$IP_LOOKUP_CACHE_DIR" ]] && chmod 700 "$IP_LOOKUP_CACHE_DIR" 2>/dev/null || true
+if [[ "${EGRESS_DEBUG_MTR:-0}" == 1 && "$MTR_AVAILABLE" == 1 ]]; then
+    if install -d -m 700 "$CACHE_DIR/mtr-debug" 2>/dev/null; then
+        LC_ALL=C timeout -k 1 1 mtr --version > "$CACHE_DIR/mtr-debug/version.txt" 2>&1 || true
+    fi
+fi
 
 sanitize() { LC_ALL=C tr -d '\000-\037\177'; }
 strip_bom() { local s="$1"; s="${s#$'\xef\xbb\xbf'}"; printf '%s' "$s"; }
@@ -598,9 +603,16 @@ ip_family() {
 }
 
 run_mtr_report() {
-    local ip_flag="$1" destination="$2" limit="${3:-$MTR_TIMEOUT}"
-    local -a cmd=(mtr "$ip_flag" -r -n -c "$MTR_COUNT" -m "$MTR_MAXTTL" "$destination")
+    local ip_flag="$1" destination="$2" limit="${3:-$MTR_TIMEOUT}" mode="${4:-numeric}"
+    local -a cmd=(mtr "$ip_flag" -r -w -o 'L S N A B W V' -c "$MTR_COUNT" -m "$MTR_MAXTTL")
+    if [[ "$mode" == compat ]]; then cmd+=(-b); else cmd+=(-n); fi
+    cmd+=("$destination")
     if command -v nice >/dev/null 2>&1; then cmd=(nice -n "$MTR_NICE" "${cmd[@]}"); fi
+    if [[ "${EGRESS_DEBUG_MTR:-0}" == 1 ]]; then
+        printf 'command: LC_ALL=C timeout -k 1 %q ' "$limit" >&2
+        printf '%q ' "${cmd[@]}" >&2
+        printf '\n' >&2
+    fi
     LC_ALL=C timeout -k 1 "$limit" "${cmd[@]}"
 }
 
@@ -625,8 +637,8 @@ resolve_mtr_target() {
 # Kept inline so bash <(curl .../ip.sh) remains self-contained. No awk interval
 # expressions, implementation-specific match captures, or strtonum are needed.
 parse_mtr_report() {
-    local ip_flag="$1" target="${2:-}"
-    LC_ALL=C awk -v family="$ip_flag" -v target="$target" '
+    local ip_flag="$1" target="${2:-}" diagnostic="${3:-}"
+    LC_ALL=C awk -v family="$ip_flag" -v target="$target" -v diagnostic="$diagnostic" '
         function ipv4(s, a,n,i,r) {
             n=split(s,a,".")
             if (n != 4) return ""
@@ -678,22 +690,44 @@ parse_mtr_report() {
             return (ip ~ /^10\./ || ip ~ /^192\.168\./ || ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./ || ip ~ /^127\./ || ip ~ /^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./ || ip ~ /^169\.254\./ || ip ~ /^0\./ || ip ~ /^22[4-9]\./ || ip ~ /^2[3-5][0-9]\./)
         }
         function number(v) { return v ~ /^[0-9]+([.][0-9]+)?$/ }
+        function reject(reason) {
+            malformed=1
+            if (!rejected && diagnostic!="") {
+                print "parse_reason: " reason "\nrejected_line: " $0 > diagnostic
+                close(diagnostic)
+            }
+            rejected=1
+        }
         BEGIN { target_key=address(target); latency="-" }
         {
             gsub(/\r/, "")
             gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "")
+            if ($1=="HOST:") {
+                # Statistics occupy the rightmost columns. Hostnames, ASN
+                # prefixes and hostname (IP) pairs may occupy several words.
+                stats=0; loss_offset=-1; sent_offset=-1; avg_offset=-1
+                for (i=NF;i>=3;i--) {
+                    if ($i !~ /^(Loss%|Drop|Rcv|Snt|Last|Avg|Best|Wrst|StDev|Gmean|Jttr|Javg|Jmax|Jint)$/) break
+                    stats++
+                    if ($i=="Loss%") loss_offset=NF-i
+                    if ($i=="Snt") sent_offset=NF-i
+                    if ($i=="Avg") avg_offset=NF-i
+                }
+                header=(loss_offset>=0 && sent_offset>=0 && avg_offset>=0)
+                next
+            }
             if ($1 !~ /^[0-9]+[.]?([|]--)?$/) next
             rows++
-            loss_col=0
-            for (i=3;i<=NF;i++) if ($i ~ /^[0-9]+([.][0-9]+)?%$/) { loss_col=i; break }
-            if (!loss_col || NF<loss_col+6) { malformed=1; next }
-            loss=$loss_col; sub(/%$/,"",loss)
-            sent=$(loss_col+1); avg=$(loss_col+3)
-            if (loss+0>100 || sent !~ /^[0-9]+$/ || !number(avg)) { malformed=1; next }
-            raw=$(loss_col-1); sub(/^\(/,"",raw); sub(/\)$/,"",raw)
-            if (raw=="???" || raw=="*" || raw=="(waiting for reply)") next
+            # No-response records need not contain a full set of statistics.
+            if ($2=="???" || $2=="*" || $0 ~ /^[[:space:]]*[0-9]+[.]?([|]--)?[[:space:]]+\(waiting for reply\)/) next
+            if (!header || NF<stats+2) { reject("missing header or statistics"); next }
+            loss=$(NF-loss_offset); sent=$(NF-sent_offset); avg=$(NF-avg_offset)
+            if (loss !~ /^[0-9]+([.][0-9]+)?%$/) { reject("invalid loss column"); next }
+            sub(/%$/,"",loss)
+            if (loss+0>100 || sent !~ /^[0-9]+$/ || !number(avg)) { reject("invalid loss, sent or average value"); next }
+            raw=$(NF-stats); sub(/^\(/,"",raw); sub(/\)$/,"",raw)
             key=address(raw)
-            if (key=="") { malformed=1; next }
+            if (key=="") { reject("invalid or truncated hop address"); next }
             if (sent+0==0 || loss+0>=100) next
             last_responding_key=key
             if (target_key!="" && key==target_key) { reached=1; latency=avg; next }
@@ -702,9 +736,9 @@ parse_mtr_report() {
             }
         }
         END {
-            # An unrecognised hop could be the first public hop: do not silently
-            # skip it and classify a later router as the egress.
-            if (!rows || malformed) { print "__PARSE_ERROR__\t-\t"; exit }
+            # Keep confirmed target timing even when route evidence is unsafe.
+            if (!rows) reject("no hop records")
+            if (malformed) { print "__PARSE_ERROR__\t" latency "\t"; exit }
             path=""; first=""; previous=""
             for (i=1;i<=count;i++) {
                 # Without target identity, even the last responding address
@@ -721,9 +755,11 @@ parse_mtr_report() {
 }
 
 # A single budget covers target resolution and every MTR attempt. Repeating a
-# format/permission error cannot improve the route, and hidden is conclusive.
+# no-response result cannot reveal hidden routes; only format errors get one
+# compatibility attempt, while transient timeouts respect MTR_ATTEMPTS.
 first_public_hop() {
     local ip_flag="$1" domain="$2" output attempt parsed ip latency path_ips rc
+    local mode=numeric format_retry=0 diagnostic="" known_latency=""
     local target destination fallback=$'__PROBE_FAILED__\t-\t' deadline remaining limit
     is_valid_domain "$domain" || { printf '%s' "$fallback"; return; }
     if [[ "${MTR_AVAILABLE:-1}" == 0 || ( "$ip_flag" == -4 && "${V4_MTR_AVAILABLE:-1}" == 0 ) || ( "$ip_flag" == -6 && "${V6_MTR_AVAILABLE:-1}" == 0 ) ]]; then
@@ -741,40 +777,65 @@ first_public_hop() {
         limit=$MTR_TIMEOUT
         (( limit > remaining )) && limit=$remaining
         rc=0
-        output="$(run_mtr_report "$ip_flag" "$destination" "$limit" 2>&1)" || rc=$?
+        output="$(run_mtr_report "$ip_flag" "$destination" "$limit" "$mode" 2>&1)" || rc=$?
         if [[ "${EGRESS_DEBUG_MTR:-0}" == "1" ]]; then
             local dbg_dir dbg_file safe_domain
             dbg_dir="$CACHE_DIR/mtr-debug"
             install -d -m 700 "$dbg_dir" 2>/dev/null || true
             safe_domain="$(printf '%s' "$domain" | sed 's/[^A-Za-z0-9_.-]/_/g')"
-            dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${attempt}-numeric.txt"
+            dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${attempt}-${mode}.txt"
+            diagnostic="${dbg_file%.txt}.parse.txt"
+            : > "$diagnostic" 2>/dev/null || diagnostic=""
             {
+                printf 'report_mode: %s\nfields: L S N A B W V\n' "$mode"
                 printf 'destination: %s\nattempt: %s\nlimit_seconds: %s\nexit_status: %s\n--- output ---\n' "$destination" "$attempt" "$limit" "$rc"
                 printf '%s\n' "$output"
             } > "$dbg_file" 2>/dev/null || true
         fi
-        if (( rc == 126 || rc == 127 )); then printf '__MTR_UNAVAILABLE__\t-\t'; return; fi
+        if (( rc == 126 || rc == 127 )); then printf '__MTR_UNAVAILABLE__\t%s\t' "${known_latency:--}"; return; fi
         if (( rc != 0 )); then
             case "${output,,}" in
                 *permission\ denied*|*operation\ not\ permitted*|*unable\ to\ get\ raw\ sockets*|*failure\ to\ open\ ipv4\ sockets*|*failure\ to\ open\ ipv6\ sockets*)
-                    printf '__MTR_UNAVAILABLE__\t-\t'; return ;;
+                    printf '__MTR_UNAVAILABLE__\t%s\t' "${known_latency:--}"; return ;;
             esac
         fi
         parsed=""
-        if [[ -n "$output" ]]; then
-            parsed="$(printf '%s\n' "$output" | parse_mtr_report "$ip_flag" "$target")" || parsed=$'__PARSE_ERROR__\t-\t'
+        if [[ -n "$output" || "$rc" == 0 ]]; then
+            parsed="$(printf '%s\n' "$output" | parse_mtr_report "$ip_flag" "$target" "$diagnostic")" || parsed=$'__PARSE_ERROR__\t-\t'
         fi
         IFS=$'\t' read -r ip latency path_ips <<< "$parsed"
+        if [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            known_latency="$latency"
+        elif [[ -n "$known_latency" && -n "$ip" ]]; then
+            latency="$known_latency"
+            parsed="${ip}"$'\t'"${latency}"$'\t'"${path_ips}"
+        fi
         case "$ip" in
             __HIDDEN__)
-                if (( rc == 0 )); then printf '%s' "$parsed"; return; fi ;;
+                # A confirmed target reply remains valid in partial output.
+                printf '%s' "$parsed"; return ;;
             __PARSE_ERROR__)
-                if (( rc == 0 )); then printf '%s' "$parsed"; return; fi ;;
+                # Keep confirmed RTT even if the report was cut off by timeout.
+                if (( rc == 0 )) || [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                    fallback="$parsed"
+                fi
+                if (( rc == 0 )); then
+                    if (( format_retry == 0 )); then mode=compat; format_retry=1; continue; fi
+                    break
+                fi ;;
             __UNCONFIRMED__)
-                if (( rc == 0 )); then fallback="$parsed"; fi ;;
-            "") ;;
+                if (( rc == 0 )); then
+                    if [[ "$fallback" == __PARSE_ERROR__* && "$fallback" != $'__PARSE_ERROR__\t-\t' ]]; then parsed="$fallback"; fi
+                    printf '%s' "$parsed"; return
+                fi ;;
+            "")
+                if (( rc == 0 && format_retry == 0 )); then
+                    fallback=$'__PARSE_ERROR__\t-\t'; mode=compat; format_retry=1; continue
+                fi ;;
             *) printf '%s' "$parsed"; return ;;
         esac
+        # The compatibility mode is attempted only once, even when it times out.
+        [[ "$mode" == compat ]] && break
         # A non-timeout command error is permanent for this probe. Preserve any
         # valid route from partial output above, but do not repeat the failure.
         if (( rc != 0 && rc != 124 )); then break; fi
@@ -821,7 +882,7 @@ detect_mtr_base_asn() {
     IFS=$'\t' read -r hop latency path_ips <<< "$hop_line"
     if [[ "$hop" == "__MTR_UNAVAILABLE__" ]]; then
         if [[ "${MTR_AVAILABLE:-1}" == 1 ]]; then
-            err "MTR 无法运行，将仅检测 TCP 443 连接延迟（无法判断路径分流）"
+            printf '[*] 当前环境无法运行 MTR，将显示 TCP 443 连接延迟；路径信息不可用\n' >&2
         fi
         printf -v "${prefix}_MTR_AVAILABLE" '%s' 0
     fi
@@ -985,11 +1046,11 @@ print_result_row() {
     if [[ -z "$asn" ]]; then asn_isp="$isp"; else asn_isp="AS${asn} ${isp}"; fi
     if [[ "$is_split" == "1" ]]; then
         latency_disp="$(printf '%s%s%s' "$YELLOW" "$(format_latency_text "$latency")" "$R")"
-        [[ "${9:-}" == tcp_connect ]] && latency_disp+=" TCP"
+        if [[ "${9:-}" == tcp_connect ]]; then latency_disp+=" TCP"; else latency_disp+="    "; fi
         printf "      %b  %s%-24s  %-15s  %b  %s%-3s  %-34s  ⮜ 分流%s\n" "$marker" "$YELLOW" "$domain" "$ip" "$latency_disp" "$YELLOW" "$cc" "${asn_isp:0:34}" "$R"
     else
         latency_disp="$(format_latency "$latency")"
-        [[ "${9:-}" == tcp_connect ]] && latency_disp+=" TCP"
+        if [[ "${9:-}" == tcp_connect ]]; then latency_disp+=" TCP"; else latency_disp+="    "; fi
         printf "      %b  %-24s  %-15s  %b  %-3s  %s%s%s\n" "$marker" "$domain" "$ip" "$latency_disp" "$cc" "$DIM" "${asn_isp:0:34}" "$R"
     fi
 }
@@ -1107,9 +1168,10 @@ run_check_pass() {
                 __PARSE_ERROR__) reason="parse_error"; failure_text="MTR 报告解析失败" ;;
                 __UNCONFIRMED__) reason="no_public_hop"; failure_text="未发现公网中间跳 / 目标回应未确认" ;;
             esac
-            if [[ "$latency_source" == tcp_connect && "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            if [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
                 result_status="partial"; latency_json="$latency"; marker="$SYM_SKIP"
-                failure_text+=" / 仅连接延迟，路径不可用"
+                if [[ "$latency_source" == tcp_connect ]]; then failure_text="仅连接延迟，路径不可用"
+                else failure_text="仅目标延迟，路径不可用"; fi
                 eval "${prefix}_PARTIAL=\$((${prefix}_PARTIAL+1))"
             else
                 eval "${prefix}_DOWN=\$((${prefix}_DOWN+1))"
@@ -1348,7 +1410,7 @@ jq -n --arg ts "$START_TS" --arg host "$HOST_NAME" --arg ver "$VERSION" --arg de
 LAST_JSON="$CACHE_DIR/last.json"
 if mv -f -- "$FINAL_JSON" "$LAST_JSON" 2>/dev/null; then chmod 600 "$LAST_JSON" 2>/dev/null || true; FINAL_JSON=""
 else err "保存 last.json 失败"; fi
-TOTAL_DOWN=$((V4_DOWN + V6_DOWN + V4_PARTIAL + V6_PARTIAL))
+TOTAL_DOWN=$((V4_DOWN + V6_DOWN))
 [[ $V4_PASS_RAN -eq 0 && $V6_PASS_RAN -eq 0 ]] && exit 2
 [[ $TOTAL_DOWN -gt 0 ]] && exit 2
 exit 0

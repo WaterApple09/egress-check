@@ -9,7 +9,7 @@
 复制下面这一行到 SSH 里运行：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.sh) -I
+bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main/ip.sh) -I
 ```
 
 运行后输入 `1-7` 选择检测模式：
@@ -27,19 +27,19 @@ bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.s
 一键`完整分流`检测：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main/ip.sh)
 ```
 
 快速`AI分流`查询：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.sh) --only AI
+bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main/ip.sh) --only AI
 ```
 
 快速`社交媒体分流`查询：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.sh) --only Social
+bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main/ip.sh) --only Social
 ```
 
 ## 核心卖点
@@ -52,39 +52,13 @@ bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.s
 
 ![Egress-Check 分流检测效果图](assets/egress-check-preview.png)
 
-## Fork 修复：MTR 解析兼容性与结果判定
+## v2.19 修复
 
-- IPv4 / IPv6 解析不再依赖 awk 的区间正则，支持旧版 mawk 和 BusyBox awk；IPv4 检查四段范围，IPv6 支持压缩写法及等价地址比较。
-- 能使用 `getent ahostsv4/ahostsv6` 时，先选取一个目标地址并对该地址探测，避免域名多地址或 DNS 变化导致目标判断不一致。没有可用解析结果时仍探测域名，但保守排除最后一个响应地址，不将其直接认定为公网中间跳。
-- 只有确认目标地址实际回应、且没有可见公网中间跳时，才显示「路径隐藏 / 仅目标可见」。目标延迟也只取已确认目标的响应；无法确认时为 `-` / JSON `null`。
-- 解析失败、探测失败、没有可见公网中间跳分别显示原因。JSON 区分 `ok` / `hidden` / `partial` / `down` 状态；路径失败时提供 `reason`，详见下文。
-- MTR 始终使用数值地址模式，避免反向 DNS 等待；已确认的公网路径或「仅目标可见」立即返回。明确的格式、权限或命令错误不重复探测；未确认结果默认最多探测两次。
-- `MTR_TOTAL_TIMEOUT` 默认 12 秒，共享于目标解析及所有 MTR 尝试，`MTR_TIMEOUT` 仍控制单次上限。目标预解析最多占用 3 秒；超时终止另有最多 1 秒的强制结束宽限，不再按轮次额外休眠。
-- `EGRESS_DEBUG_MTR=1` 的日志按尝试次数保存，包含探测地址、单次时间限制、退出状态和错误输出。超时返回的有效中间跳仍可用于路径观察。
-
-### MTR 不可用时保留连接延迟
-
-MTR 未安装、权限不足、报告解析失败或没有确认目标延迟时，脚本使用 curl 测量目标的 **TCP 443 连接建立耗时**。MTR 成为可选依赖，不再为安装它阻塞检测；原有 jq 等依赖仍需可用。确认某地址族的 MTR 权限异常后，本轮该地址族后续域名直接测连接延迟。
-
-- 从 curl 的 `time_connect` 中扣除 `time_namelookup`，不将 DNS、TLS 握手和服务器响应耗时计入连接延迟。即使 TCP 连接后的 TLS/HTTP 步骤失败，仍保留已取得的 TCP 测量值。
-- 测量使用请求指定的 IPv4/IPv6，禁用代理、curl 配置文件和重定向；独立解析该域名，CDN 场景中可能连接到不同于 MTR 的地址。
-- 单次请求默认 `LATENCY_TIMEOUT=3` 秒；外层守护多留 1 秒以收集 curl 超时后的计时输出，并有 1 秒强制结束宽限。TCP 未连接成功时显示未知，不伪造为 `0ms`。
-- 终端在数值后标记 `TCP`；JSON 新增 `latency_source`（`mtr` / `tcp_connect` / `null`）和 `latency_port`（TCP 为 443，否则为 `null`）。TCP 建连耗时不等同于 MTR RTT，也不代表 TLS/HTTP 服务可用。
-- 有连接延迟但没有路径证据时，JSON 为 `status:"partial"`，保留路径失败 `reason`（新增 `mtr_unavailable`），ASN、首跳和分流结论保持 `null`。汇总单列 `partial` /「仅延迟」，不计入 `down`；路径和连接都失败才计入 `down`。
-- 路径失败原因包括 `mtr_unavailable`、`parse_error`、`probe_failed` 和 `no_public_hop`。顶层 `split_routing_detected` 在已检测到多条线路时为 `true`；结果完整且只有一条线路时为 `false`；其余证据不足的情况为 `null`。
-- 退出码 2 表示仍有路径探测不完整，包括 `partial`，不意味着该域名的 TCP 连接失败。已有 MTR 路径但缺少目标延迟时，也可补充 TCP 延迟，同时保留路径结果。
-
-例如：`MTR_TOTAL_TIMEOUT=8 LATENCY_TIMEOUT=2 bash ip.sh -4` 可进一步缩短每个域名的探测等待。ASN 查询、出口检测及显示不包含在 MTR 时间预算中。
-
-离线回归测试不发送探测流量：
-
-```bash
-python3 -m unittest discover -s tests -v
-EGRESS_TEST_AWK=mawk python3 -m unittest discover -s tests -v
-EGRESS_TEST_AWK='busybox awk' python3 -m unittest discover -s tests -v
-```
-
-测试需要 Bash、Python 3、jq 和所选择的 awk。CI 覆盖 gawk、mawk、BusyBox awk，以及 Ubuntu 20.04 中不支持区间正则的旧版 mawk。
+- 修复旧版 mawk / BusyBox awk 下公网跳识别失败的问题，兼容 IPv4、压缩 IPv6 和等价地址写法
+- MTR 改用宽报告和明确的统计字段，按表头解析，避免长 IPv6 被截断；`???`、`*`、`(waiting for reply)` 作为正常无响应处理
+- 正常路径不可见不再重复探测；格式异常最多兼容重试一次，所有尝试共享时间预算，减少等待
+- MTR 不可用或路径信息不足时保留目标延迟，必要时补充 TCP 443 连接延迟；仅延迟结果不再导致退出码 2
+- 同步版本号、运行链接和调试说明，保留路径不确定性，不将目标服务器误判为出口
 
 ## v2.18 优化
 
@@ -174,6 +148,8 @@ EGRESS_TEST_AWK='busybox awk' python3 -m unittest discover -s tests -v
 
 这种情况下，需要确认商家是否对某些流量做了“线路优化 / 分流”。本工具会批量检测 100+ 个主流服务，帮助你快速验证服务器是否存在分流情况。
 
+本仓库基于 [AIFansX/egress-check](https://github.com/AIFansX/egress-check) 维护。
+
 鸣谢：[https://ip.net.coffee](https://ip.net.coffee)
 
 ## 怎么看结果
@@ -181,9 +157,14 @@ EGRESS_TEST_AWK='busybox awk' python3 -m unittest discover -s tests -v
 - 绿色：和默认出口同一条线路
 - 黄色 `⮜ 分流`：走了不同出口线路
 - 灰色 `路径隐藏 / 仅目标可见`：mtr 看不到中间公网跳，无法用于分流判断
-- 延迟列：VPS 到目标域名最后一跳的 mtr Avg，`<50ms` 绿色，`50-200ms` 黄色，`>200ms` 棕色
+- 灰色 `仅连接延迟，路径不可用`：连接已建立，但环境没有提供足够路径证据；NAT / LXD / 家宽中很常见，不表示域名故障
+- 延迟列：优先使用已确认目标的 mtr Avg；后缀 `TCP` 表示 TCP 443 建连耗时（扣除 DNS，不含 TLS / HTTP），两者不可直接当成同一种 RTT。`<50ms` 绿色，`50-200ms` 黄色，`>200ms` 棕色
 - 底部汇总：告诉你一共分了几条线，每条线走哪些域名
 - 路径 ASN 摘要：辅助观察到达目标前的中途 ASN 变化，不直接等同于分流判断
+
+JSON 的 `status` 分为 `ok`（有路径）、`hidden`（确认目标回应、仅目标可见）、`partial`（仅延迟）和 `down`（路径与延迟均无可用结果）。`partial` 的 ASN、首跳和分流结论为 `null`，不会因连接成功就判定「未分流」。`reason` 保留 `mtr_unavailable`、`parse_error`、`probe_failed` 或 `no_public_hop`，用于排查路径信息不足的原因。
+
+`latency_source` 为 `mtr` / `tcp_connect` / `null`，`latency_port` 仅 TCP 为 443。汇总分别统计 `hidden`、`partial`、`down`；分流证据不足时 `split_routing_detected` 为 `null`，已经发现多条线路时仍为 `true`。退出码 `0` 表示检测完成（包括路径隐藏或仅延迟），`1` 表示配置 / 依赖错误，`2` 表示存在 `down` 或没有可检测的地址族；`down` 也不能直接断言服务离线。
 
 ![Egress-Check 路径 ASN 摘要效果图](assets/path-asn-summary-preview.png)
 
@@ -207,7 +188,7 @@ AS22773 Cox Communications Inc. -> AS13335 Cloudflare, Inc.   12 域名
 <summary>本地安装和高级用法</summary>
 
 ```bash
-git clone https://github.com/AIFansX/egress-check.git
+git clone https://github.com/WaterApple09/egress-check.git
 cd egress-check
 chmod +x ip.sh
 cp rules.conf.example rules.conf
@@ -237,9 +218,29 @@ MTR_CONCURRENCY=2 MTR_COUNT=2 ./ip.sh
 如果遇到手动 `mtr` 正常、脚本却显示“探测失败 / 无公网跳”，可以开启调试：
 
 ```bash
-EGRESS_DEBUG_MTR=1 bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.sh) --only AI
+EGRESS_DEBUG_MTR=1 bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main/ip.sh) --only AI
 ls -la ~/.cache/egress-check/mtr-debug/
 ```
+
+默认使用数值地址宽报告（`-n -w`），不等待反向 DNS；只有报告格式异常 / 空报告才尝试一次名称加地址模式（`-b -w`）。正常无响应或路径不可见不会触发该兼容尝试。调试日志包含 MTR 版本、实际命令、报告模式、统计字段、目标地址、预算、退出状态、原始输出（含标准错误），以及首个拒绝行和解析原因（`.parse.txt`）。
+
+- `MTR_ATTEMPTS=2`：最多尝试次数，仅用于格式兼容或超时；权限 / 命令错误不反复探测。
+- `MTR_TOTAL_TIMEOUT=12`：目标预解析和所有 MTR 尝试共享的秒数；`MTR_TIMEOUT=20` 为单次上限，实际取剩余预算。目标预解析最多 3 秒，终止进程另有最多 1 秒宽限。
+- `LATENCY_TIMEOUT=3`：TCP 测量上限；外层守护多留 1 秒收集计时输出，另有 1 秒强制结束宽限。出口检测、ASN 查询及显示不包含在 MTR 预算内。
+
+例如：`MTR_TOTAL_TIMEOUT=8 LATENCY_TIMEOUT=2 ./ip.sh -4` 可进一步缩短等待。
+
+有 `getent` 时先固定一个目标地址供 MTR 探测；没有明确目标地址时保守排除最后一个响应地址。TCP 测量独立解析域名，禁用代理、curl 配置和重定向，CDN 下可能连接到另一地址。TCP 建连成功后的 TLS / HTTP 错误不抹掉连接计时，但计时不代表网站服务正常。解析异常也不抹掉已确认目标的 MTR 延迟，此时显示「仅目标延迟，路径不可用」。
+
+兼容性测试：
+
+```bash
+python3 -m unittest discover -s tests -v
+EGRESS_TEST_AWK=mawk python3 -m unittest discover -s tests -v
+EGRESS_TEST_AWK='busybox awk' python3 -m unittest discover -s tests -v
+```
+
+需要 Bash、Python 3、jq、curl 和所选 awk。CI 覆盖 gawk、mawk、BusyBox awk 与 Ubuntu 20.04 旧 mawk，并设置 `EGRESS_TEST_REAL_MTR=1` 使用已安装的 MTR 对本机回环地址验证真实报告；普通测试不访问公网。
 
 `rules.conf` 语法：
 
@@ -257,7 +258,8 @@ ls -la ~/.cache/egress-check/mtr-debug/
 纯 bash 明文，无混淆、无持久化、无提权后门。联网仅用于：
 
 - `mtr` 探测公开域名
-- `curl` 查询 ASN 和出口 IP
+- `curl` 查询 ASN 和出口 IP，以及向待测域名发出 HTTPS HEAD 请求以补充 TCP 连接计时
+- 缺少 `jq` 时通过系统软件源安装依赖
 
 可自行审计：
 
@@ -283,7 +285,7 @@ grep -nE 'crontab|authorized_keys|nohup|disown|/dev/tcp|bash -i|curl.*\|.*sh' ip
 
 不适合直接在 Windows CMD / PowerShell 里运行；如果是 Windows，需要 WSL 这类 Linux 环境。
 
-脚本会自动检测并尝试安装 `mtr` 和 `jq`：
+脚本会自动检测并尝试安装 `jq`。`mtr` 是可选依赖，缺少或没有 raw socket 权限时仍检测连接延迟，不会为安装 MTR 阻塞检测。需要路径信息时可手动安装：
 
 ```text
 apt-get install mtr-tiny jq / mtr jq
@@ -311,7 +313,7 @@ grep
 
 大多数 VPS 默认已有 `curl`、`awk`、`grep`、`timeout`，极简系统如果缺失会按提示手动补装。
 
-如果商家禁用了 ICMP / traceroute / mtr 所需能力，或者容器环境不允许 raw socket，即使依赖齐全也可能探测失败。这属于运行环境限制，不是脚本逻辑问题。
+如果商家禁用了 ICMP / traceroute / mtr 所需能力，或者容器环境不允许 raw socket，即使依赖齐全也可能没有可见路径。这是常见运行结果，脚本仍保留可用连接延迟；没有路径证据时不作分流判断。
 
 </details>
 
