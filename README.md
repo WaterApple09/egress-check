@@ -54,6 +54,25 @@ bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.s
 
 ## v2.18 优化
 
+### Fork 修复：MTR 解析兼容性与结果判定
+
+- IPv4 / IPv6 解析不再依赖 awk 的区间正则，支持旧版 mawk 和 BusyBox awk；IPv4 检查四段范围，IPv6 支持压缩写法及等价地址比较。
+- 能使用 `getent ahostsv4/ahostsv6` 时，先选取一个目标地址并对该地址探测，避免域名多地址或 DNS 变化导致目标判断不一致。没有可用解析结果时仍探测域名，但保守排除最后一个响应地址，不将其直接认定为公网中间跳。
+- 只有确认目标地址实际回应、且没有可见公网中间跳时，才显示「路径隐藏 / 仅目标可见」。目标延迟也只取已确认目标的响应；无法确认时为 `-` / JSON `null`。
+- 解析失败、探测失败、没有可见公网中间跳分别显示原因。JSON 保留 `ok` / `hidden` / `down` 状态，并为 `down` 增加 `reason`：`parse_error`、`probe_failed` 或 `no_public_hop`。`down` 仍计入失败统计并导致退出码 2。
+- 不完整结果继续尝试数值地址模式、主机名加地址模式及后续重试；优先返回可见公网路径。若始终没有更完整路径，保留已确认的目标回应。
+- `EGRESS_DEBUG_MTR=1` 的日志按尝试次数和模式分别保存，包含探测地址、退出状态和错误输出。超时返回的有效中间跳仍可用于路径观察。
+
+离线回归测试不发送探测流量：
+
+```bash
+python3 -m unittest discover -s tests -v
+EGRESS_TEST_AWK=mawk python3 -m unittest discover -s tests -v
+EGRESS_TEST_AWK='busybox awk' python3 -m unittest discover -s tests -v
+```
+
+测试需要 Bash、Python 3、jq 和所选择的 awk。CI 覆盖 gawk、mawk、BusyBox awk，以及 Ubuntu 20.04 中不支持区间正则的旧版 mawk。
+
 - 新增 LINE、LINE TV 和 Zoom 分流检测
 - Steam 新增 CDN 线路检测，不再只检测商店与社区页面
 - Twitch 新增 CDN 线路检测，不再只检测官网首页

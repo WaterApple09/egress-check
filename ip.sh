@@ -595,155 +595,178 @@ ip_family() {
 }
 
 run_mtr_report() {
-    local ip_flag="$1" mode="$2" domain="$3"
-    if [[ "$mode" == "numeric" ]]; then
-        if command -v nice >/dev/null 2>&1; then
-            timeout "$MTR_TIMEOUT" nice -n "$MTR_NICE" mtr "$ip_flag" -r -n -c "$MTR_COUNT" -m "$MTR_MAXTTL" "$domain" 2>/dev/null || true
+    local ip_flag="$1" mode="$2" destination="$3"
+    local -a cmd=(mtr "$ip_flag" -r -c "$MTR_COUNT" -m "$MTR_MAXTTL")
+    if [[ "$mode" == "numeric" ]]; then cmd+=(-n); else cmd+=(-b); fi
+    cmd+=("$destination")
+    if command -v nice >/dev/null 2>&1; then cmd=(nice -n "$MTR_NICE" "${cmd[@]}"); fi
+    LC_ALL=C timeout "$MTR_TIMEOUT" "${cmd[@]}"
+}
+
+# Pin the probe to one resolver result so a responding hop can be identified as
+# the actual destination. getent is optional; without it we report uncertainty.
+resolve_mtr_target() {
+    local ip_flag="$1" domain="$2" database line address
+    command -v getent >/dev/null 2>&1 || return 0
+    if [[ "$ip_flag" == "-6" ]]; then database=ahostsv6; else database=ahostsv4; fi
+    while IFS= read -r line; do
+        read -r address _ <<< "$line"
+        if [[ "$ip_flag" == "-6" ]]; then
+            [[ "$address" == *:* && "$address" != ::ffff:* ]] || continue
         else
-            timeout "$MTR_TIMEOUT" mtr "$ip_flag" -r -n -c "$MTR_COUNT" -m "$MTR_MAXTTL" "$domain" 2>/dev/null || true
+            [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
         fi
-    else
-        if command -v nice >/dev/null 2>&1; then
-            timeout "$MTR_TIMEOUT" nice -n "$MTR_NICE" mtr "$ip_flag" -r -c "$MTR_COUNT" -m "$MTR_MAXTTL" "$domain" 2>/dev/null || true
-        else
-            timeout "$MTR_TIMEOUT" mtr "$ip_flag" -r -c "$MTR_COUNT" -m "$MTR_MAXTTL" "$domain" 2>/dev/null || true
-        fi
-    fi
+        printf '%s' "$address"
+        return 0
+    done < <(LC_ALL=C timeout "$ENV_TIMEOUT" getent "$database" "$domain" 2>/dev/null || true)
+}
+
+# Kept inline so bash <(curl .../ip.sh) remains self-contained. No awk interval
+# expressions, implementation-specific match captures, or strtonum are needed.
+parse_mtr_report() {
+    local ip_flag="$1" target="${2:-}"
+    LC_ALL=C awk -v family="$ip_flag" -v target="$target" '
+        function ipv4(s, a,n,i,r) {
+            n=split(s,a,".")
+            if (n != 4) return ""
+            r=""
+            for (i=1;i<=4;i++) {
+                if (a[i] !~ /^[0-9]+$/ || length(a[i])>3 || a[i]+0>255) return ""
+                r=r (i>1 ? "." : "") (a[i]+0)
+            }
+            return r
+        }
+        function hex(s, i,v) {
+            v=0
+            for (i=1;i<=length(s);i++) v=v*16+index("0123456789abcdef",substr(s,i,1))-1
+            return v
+        }
+        function ipv6(s, a,b,n,m,p,i,r,v,t,tail) {
+            s=tolower(s)
+            if (s !~ /:/ || s ~ /[^0-9a-f:.]/) return ""
+            if (s ~ /[.]/) {
+                t=s; sub(/^.*:/,"",t); tail=ipv4(t)
+                if (tail=="") return ""
+                split(tail,b,".")
+                s=substr(s,1,length(s)-length(t)) sprintf("%x:%x",b[1]*256+b[2],b[3]*256+b[4])
+            }
+            p=index(s,"::")
+            if (p) {
+                t=substr(s,p+2)
+                if (index(t,"::")) return ""
+                n=(p==1 ? 0 : split(substr(s,1,p-1),a,":"))
+                m=(t=="" ? 0 : split(t,b,":"))
+                if (n+m>=8) return ""
+            } else {
+                n=split(s,a,":"); m=0
+                if (n!=8) return ""
+            }
+            r=""
+            for (i=1;i<=8;i++) {
+                if (i<=n) v=a[i]
+                else if (i>8-m) v=b[i-(8-m)]
+                else v="0"
+                if (v !~ /^[0-9a-f]+$/ || length(v)>4) return ""
+                r=r (i>1 ? ":" : "") sprintf("%04x",hex(v))
+            }
+            return r
+        }
+        function address(s) { return family=="-6" ? ipv6(s) : ipv4(s) }
+        function private_ip(ip) {
+            if (family=="-6") return (ip ~ /^fe[89ab]/ || ip ~ /^f[cd]/ || ip ~ /^ff/ || ip=="0000:0000:0000:0000:0000:0000:0000:0000" || ip=="0000:0000:0000:0000:0000:0000:0000:0001")
+            return (ip ~ /^10\./ || ip ~ /^192\.168\./ || ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./ || ip ~ /^127\./ || ip ~ /^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./ || ip ~ /^169\.254\./ || ip ~ /^0\./ || ip ~ /^22[4-9]\./ || ip ~ /^2[3-5][0-9]\./)
+        }
+        function number(v) { return v ~ /^[0-9]+([.][0-9]+)?$/ }
+        BEGIN { target_key=address(target); latency="-" }
+        {
+            gsub(/\r/, "")
+            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "")
+            if ($1 !~ /^[0-9]+[.]?([|]--)?$/) next
+            rows++; last_row=rows
+            loss_col=0
+            for (i=3;i<=NF;i++) if ($i ~ /^[0-9]+([.][0-9]+)?%$/) { loss_col=i; break }
+            if (!loss_col || NF<loss_col+6) { malformed=1; next }
+            loss=$loss_col; sub(/%$/,"",loss)
+            sent=$(loss_col+1); avg=$(loss_col+3)
+            if (loss+0>100 || sent !~ /^[0-9]+$/ || !number(avg)) { malformed=1; next }
+            raw=$(loss_col-1); sub(/^\(/,"",raw); sub(/\)$/,"",raw)
+            if (raw=="???" || raw=="*" || raw=="(waiting for reply)") next
+            key=address(raw)
+            if (key=="") { malformed=1; next }
+            if (sent+0==0 || loss+0>=100) next
+            last_responding_key=key
+            if (target_key!="" && key==target_key) { reached=1; latency=avg; next }
+            if (!private_ip(key)) {
+                count++; ips[count]=raw; keys[count]=key; row_numbers[count]=rows
+            }
+        }
+        END {
+            # An unrecognised hop could be the first public hop: do not silently
+            # skip it and classify a later router as the egress.
+            if (!rows || malformed) { print "__PARSE_ERROR__\t-\t"; exit }
+            path=""; first=""; previous=""
+            for (i=1;i<=count;i++) {
+                # Without target identity, even the last responding address
+                # before trailing timeouts might be the destination.
+                if (target_key=="" && keys[i]==last_responding_key) continue
+                if (first=="") first=ips[i]
+                if (keys[i]!=previous) path=path (path=="" ? "" : " ") ips[i]
+                previous=keys[i]
+            }
+            if (first!="") print first "\t" latency "\t" path
+            else if (reached) print "__HIDDEN__\t" latency "\t"
+            else print "__UNCONFIRMED__\t-\t"
+        }'
 }
 
 first_public_hop() {
-    local ip_flag="$1" domain="$2" output attempt parsed ip latency path_ips mode cmd_text
-    is_valid_domain "$domain" || { printf ''; return; }
+    local ip_flag="$1" domain="$2" output attempt parsed ip latency path_ips mode rc
+    local target destination fallback="__PROBE_FAILED__" fallback_rank=0 rank
+    is_valid_domain "$domain" || { printf '__PROBE_FAILED__\t-\t'; return; }
+    target="$(resolve_mtr_target "$ip_flag" "$domain")"
+    destination="${target:-$domain}"
     for ((attempt=1; attempt<=MTR_ATTEMPTS; attempt++)); do
         for mode in numeric names; do
-            if [[ "$mode" == "numeric" ]]; then
-                cmd_text="mtr $ip_flag -r -n -c $MTR_COUNT -m $MTR_MAXTTL $domain"
-                output="$(run_mtr_report "$ip_flag" "$mode" "$domain")"
-            else
-                cmd_text="mtr $ip_flag -r -c $MTR_COUNT -m $MTR_MAXTTL $domain"
-                output="$(run_mtr_report "$ip_flag" "$mode" "$domain")"
-            fi
+            rc=0
+            output="$(run_mtr_report "$ip_flag" "$mode" "$destination" 2>&1)" || rc=$?
             if [[ "${EGRESS_DEBUG_MTR:-0}" == "1" ]]; then
                 local dbg_dir dbg_file safe_domain
                 dbg_dir="$CACHE_DIR/mtr-debug"
                 install -d -m 700 "$dbg_dir" 2>/dev/null || true
                 safe_domain="$(printf '%s' "$domain" | sed 's/[^A-Za-z0-9_.-]/_/g')"
-                dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${mode}.txt"
+                dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${attempt}-${mode}.txt"
                 {
-                    printf 'command: %s\nattempt: %s\n--- output ---\n' "$cmd_text" "$attempt"
+                    printf 'destination: %s\nmode: %s\nattempt: %s\nexit_status: %s\n--- output ---\n' "$destination" "$mode" "$attempt" "$rc"
                     printf '%s\n' "$output"
                 } > "$dbg_file" 2>/dev/null || true
             fi
-            if [[ -z "$output" ]]; then
-                continue
+            parsed=""
+            if [[ -n "$output" ]]; then
+                parsed="$(printf '%s\n' "$output" | parse_mtr_report "$ip_flag" "$target")" || parsed=$'__PARSE_ERROR__\t-\t'
             fi
-            if [[ "$ip_flag" == "-6" ]]; then
-            parsed=$(printf '%s\n' "$output" | awk '
-                function private_v6(ip) { return (ip ~ /^[Ff][Ee]80:/ || ip ~ /^[Ff][CcDd]/ || ip == "::1") }
-                function valid_avg(v) { return (v ~ /^[0-9]+([.][0-9]+)?$/) }
-                {
-                    line=$0
-                    gsub(/\r/, "", line)
-                    gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
-                    if (target_ip == "" && match(line, /\([0-9A-Fa-f:]+\)/)) target_ip=substr(line, RSTART+1, RLENGTH-2)
-                    if (line !~ /[0-9]+([.][0-9]+)?%/) next
-                    $0=line
-                    row_avg="-"
-                    for (i=1; i<=NF; i++) {
-                        if ($i ~ /^[0-9]+([.][0-9]+)?%$/) {
-                            avg=$(i+3)
-                            if (valid_avg(avg)) row_avg=avg
-                            break
-                        }
-                    }
-                    found_ip=0
-                    for (i=1; i<=NF; i++) {
-                        ip=$i
-                        gsub(/^[^0-9a-fA-F:.]+/, "", ip)
-                        gsub(/[^0-9a-fA-F:.]+$/, "", ip)
-                        if (ip ~ /^([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F:]+$/) {
-                            if (!private_v6(ip) && ip != target_ip) {
-                                if (first_hop == "") first_hop=ip
-                                if (ip != last_public_ip) {
-                                    path_ips = (path_ips == "" ? ip : path_ips " " ip)
-                                    last_public_ip = ip
-                                }
-                            }
-                            found_ip=1
-                            break
-                        }
-                    }
-                    target_avg=row_avg
-                }
-                END {
-                    if (first_hop != "") {
-                        if (target_avg == "") target_avg="-"
-                        print first_hop "\t" target_avg "\t" path_ips
-                    } else if (target_avg != "") {
-                        print "__HIDDEN__\t" target_avg "\t"
-                    }
-                }')
-            else
-            parsed=$(printf '%s\n' "$output" | awk '
-                function private_v4(ip) { return (ip ~ /^10\./ || ip ~ /^192\.168\./ || ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./ || ip ~ /^127\./ || ip ~ /^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./ || ip ~ /^169\.254\./ || ip ~ /^0\./ || ip ~ /^22[4-9]\./ || ip ~ /^2[3-5][0-9]\./) }
-                function valid_avg(v) { return (v ~ /^[0-9]+([.][0-9]+)?$/) }
-                {
-                    line=$0
-                    gsub(/\r/, "", line)
-                    gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
-                    if (target_ip == "" && match(line, /\(([0-9]{1,3}\.){3}[0-9]{1,3}\)/)) target_ip=substr(line, RSTART+1, RLENGTH-2)
-                    if (line !~ /[0-9]+([.][0-9]+)?%/) next
-                    $0=line
-                    row_avg="-"
-                    for (i=1; i<=NF; i++) {
-                        if ($i ~ /^[0-9]+([.][0-9]+)?%$/) {
-                            avg=$(i+3)
-                            if (valid_avg(avg)) row_avg=avg
-                            break
-                        }
-                    }
-                    found_ip=0
-                    for (i=1; i<=NF; i++) {
-                        ip=$i
-                        gsub(/^[^0-9.]+/, "", ip)
-                        gsub(/[^0-9.]+$/, "", ip)
-                        if (ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
-                            if (!private_v4(ip) && ip != target_ip) {
-                                if (first_hop == "") first_hop=ip
-                                if (ip != last_public_ip) {
-                                    path_ips = (path_ips == "" ? ip : path_ips " " ip)
-                                    last_public_ip = ip
-                                }
-                            }
-                            found_ip=1
-                            break
-                        }
-                    }
-                    target_avg=row_avg
-                }
-                END {
-                    if (first_hop != "") {
-                        if (target_avg == "") target_avg="-"
-                        print first_hop "\t" target_avg "\t" path_ips
-                    } else if (target_avg != "") {
-                        print "__HIDDEN__\t" target_avg "\t"
-                    }
-                }')
-            fi
-            if [[ -n "$parsed" ]]; then
-                IFS=$'\t' read -r ip latency path_ips <<< "$parsed"
-                [[ -n "$ip" ]] && { printf '%s\t%s\t%s' "$ip" "${latency:-"-"}" "$path_ips"; return; }
-            fi
+            IFS=$'\t' read -r ip latency path_ips <<< "$parsed"
+            case "$ip" in
+                __HIDDEN__) rank=3 ;;
+                __UNCONFIRMED__) rank=2 ;;
+                __PARSE_ERROR__) rank=1 ;;
+                "") rank=0 ;;
+                *) printf '%s\t%s\t%s' "$ip" "${latency:--}" "$path_ips"; return 0 ;;
+            esac
+            # A failed command is not evidence that the path is hidden.
+            if (( rc != 0 )); then rank=0; parsed=$'__PROBE_FAILED__\t-\t'; fi
+            if (( rank > fallback_rank )); then fallback="$parsed"; fallback_rank=$rank; fi
         done
-        sleep "$attempt"
+        if (( attempt < MTR_ATTEMPTS )); then sleep "$attempt"; fi
     done
+    printf '%s' "$fallback"
 }
+
 
 detect_mtr_base_asn() {
     local ip_flag="$1" prefix="$2" hop_line hop latency path_ips data asn isp country info
     hop_line="$(first_public_hop "$ip_flag" "$MTR_BASE_DOMAIN" || true)"
     IFS=$'\t' read -r hop latency path_ips <<< "$hop_line"
-    [[ -n "$hop" ]] || return 1
+    [[ -n "$hop" && "$hop" != __* ]] || return 1
     data="$(lookup_ip "$hop" || true)"
     split_lookup_data "$data" asn isp country
     normalize_lookup_fields asn isp country
@@ -1014,12 +1037,17 @@ run_check_pass() {
                 '{category:$c, domain:$d, status:"hidden", first_hop:null, latency_ms:$lat, path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:($note + " 路径隐藏 / 仅目标可见")}' >> "$tmp_file"
             continue
         fi
-        if [[ -z "$hop" ]]; then
+        if [[ -z "$hop" || "$hop" == __* ]]; then
+            local reason="probe_failed" failure_text="探测失败"
+            case "$hop" in
+                __PARSE_ERROR__) reason="parse_error"; failure_text="MTR 报告解析失败" ;;
+                __UNCONFIRMED__) reason="no_public_hop"; failure_text="未发现公网中间跳 / 目标回应未确认" ;;
+            esac
             eval "${prefix}_DOWN=\$((${prefix}_DOWN+1))"
-            [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$SYM_DOWN" "$domain" "-" "-" "-" "" "探测失败 / 无公网跳" 0
+            [[ $OUTPUT_JSON -eq 0 ]] && print_result_row "$SYM_DOWN" "$domain" "-" "-" "-" "" "$failure_text" 0
             [[ $first_json -eq 0 ]] && printf ',\n' >> "$tmp_file"; first_json=0
-            jq -n --arg c "$cat_v" --arg d "$domain" --arg note "$note" \
-                '{category:$c, domain:$d, status:"down", first_hop:null, latency_ms:null, path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:$note}' >> "$tmp_file"
+            jq -n --arg c "$cat_v" --arg d "$domain" --arg note "$note" --arg reason "$reason" \
+                '{category:$c, domain:$d, status:"down", reason:$reason, first_hop:null, latency_ms:null, path_asn_chain:null, asn:null, isp:null, country:null, split:null, note:$note}' >> "$tmp_file"
             continue
         fi
         local data asn isp country
@@ -1045,7 +1073,6 @@ run_check_pass() {
         [[ $is_split -eq 1 ]] && split_domain_count=$((split_domain_count+1))
         local path_chain path_asn_ips
         path_asn_ips="$path_ips"
-        [[ "$path_asn_ips" == *" "* ]] && path_asn_ips="${path_asn_ips% *}"
         path_chain="$(path_asn_chain "$path_asn_ips")"
         if [[ -n "$path_chain" ]]; then
             if [[ -z "${path_counts[$path_chain]+x}" ]]; then
