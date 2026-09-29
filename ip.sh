@@ -682,7 +682,7 @@ parse_mtr_report() {
             gsub(/\r/, "")
             gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "")
             if ($1 !~ /^[0-9]+[.]?([|]--)?$/) next
-            rows++; last_row=rows
+            rows++
             loss_col=0
             for (i=3;i<=NF;i++) if ($i ~ /^[0-9]+([.][0-9]+)?%$/) { loss_col=i; break }
             if (!loss_col || NF<loss_col+6) { malformed=1; next }
@@ -697,7 +697,7 @@ parse_mtr_report() {
             last_responding_key=key
             if (target_key!="" && key==target_key) { reached=1; latency=avg; next }
             if (!private_ip(key)) {
-                count++; ips[count]=raw; keys[count]=key; row_numbers[count]=rows
+                count++; ips[count]=raw; keys[count]=key
             }
         }
         END {

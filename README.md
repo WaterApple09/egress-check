@@ -52,9 +52,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.s
 
 ![Egress-Check 分流检测效果图](assets/egress-check-preview.png)
 
-## v2.18 优化
-
-### Fork 修复：MTR 解析兼容性与结果判定
+## Fork 修复：MTR 解析兼容性与结果判定
 
 - IPv4 / IPv6 解析不再依赖 awk 的区间正则，支持旧版 mawk 和 BusyBox awk；IPv4 检查四段范围，IPv6 支持压缩写法及等价地址比较。
 - 能使用 `getent ahostsv4/ahostsv6` 时，先选取一个目标地址并对该地址探测，避免域名多地址或 DNS 变化导致目标判断不一致。没有可用解析结果时仍探测域名，但保守排除最后一个响应地址，不将其直接认定为公网中间跳。
@@ -72,6 +70,8 @@ EGRESS_TEST_AWK='busybox awk' python3 -m unittest discover -s tests -v
 ```
 
 测试需要 Bash、Python 3、jq 和所选择的 awk。CI 覆盖 gawk、mawk、BusyBox awk，以及 Ubuntu 20.04 中不支持区间正则的旧版 mawk。
+
+## v2.18 优化
 
 - 新增 LINE、LINE TV 和 Zoom 分流检测
 - Steam 新增 CDN 线路检测，不再只检测商店与社区页面

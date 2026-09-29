@@ -266,6 +266,56 @@ printf '\\n%s %s' "$V4_DOWN" "$V4_HIDDEN"
                 self.assertIsNone(result['first_hop'])
                 self.assertEqual(actual_counts, counts)
 
+    def test_cli_json_terminal_and_exit_codes(self):
+        cases = [
+            (report(row('168.95.98.254'), row('168.95.157.114'), row('104.18.33.45')), 0, 'ok', None, '168.95.98.254'),
+            (report(row('104.18.33.45')), 0, 'hidden', None, '路径隐藏 / 仅目标可见'),
+            ('bad report', 0, 'down', 'parse_error', 'MTR 报告解析失败'),
+            (report(row('???', loss='100')), 0, 'down', 'no_public_hop', '目标回应未确认'),
+            ('mtr: permission denied', 1, 'down', 'probe_failed', '探测失败'),
+        ]
+        for fixture, command_rc, status, reason, message in cases:
+            for output_json in (True, False):
+                with self.subTest(status=status, reason=reason, json=output_json), tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp)
+                    binaries = directory / 'bin'
+                    binaries.mkdir()
+                    scripts = {
+                        'mtr': 'cat "$MTR_FIXTURE"\nexit "$MTR_TEST_RC"\n',
+                        'getent': "printf '104.18.33.45 STREAM example.com\\n'\n",
+                        'curl': '''case "$*" in
+  *ipinfo.io/*/json*) printf '%s' '{"country":"TW","org":"AS3462 Test ISP"}' ;;
+  *) printf '168.95.98.253' ;;
+esac
+''',
+                    }
+                    for name, body in scripts.items():
+                        executable = binaries / name
+                        executable.write_text('#!/bin/sh\n' + body)
+                        executable.chmod(0o755)
+                    (directory / 'report.txt').write_text(fixture)
+                    (directory / 'rules.conf').write_text('AI|example.com|||test\n')
+                    env = dict(self.env, PATH=str(binaries) + os.pathsep + self.env['PATH'],
+                               EGRESS_CACHE=str(directory / 'cache'), EGRESS_RULES=str(directory / 'rules.conf'),
+                               MTR_FIXTURE=str(directory / 'report.txt'), MTR_TEST_RC=str(command_rc),
+                               MTR_ATTEMPTS='1', MTR_CONCURRENCY='1', EGRESS_DEBUG_MTR='1')
+                    args = ['bash', str(ROOT / 'ip.sh'), '-4', '--json' if output_json else '--no-color']
+                    result = subprocess.run(args, text=True, capture_output=True, env=env, timeout=20)
+                    self.assertEqual(result.returncode, 2 if status == 'down' else 0, result.stderr)
+                    data = json.loads((directory / 'cache' / 'last.json').read_text())
+                    self.assertEqual(data['ipv4']['results'][0]['status'], status)
+                    self.assertEqual(data['ipv4']['results'][0].get('reason'), reason)
+                    self.assertEqual(data['ipv4']['summary']['down'], int(status == 'down'))
+                    if status == 'ok':
+                        self.assertEqual(data['ipv4']['results'][0]['first_hop'], '168.95.98.254')
+                    if output_json:
+                        self.assertEqual(json.loads(result.stdout), data)
+                    else:
+                        self.assertIn(message, result.stdout)
+                    logs = list((directory / 'cache' / 'mtr-debug').glob('*.txt'))
+                    self.assertTrue(logs)
+                    self.assertTrue(any(f'exit_status: {command_rc}' in log.read_text() for log in logs))
+
 
 if __name__ == '__main__':
     unittest.main()
