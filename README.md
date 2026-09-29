@@ -57,7 +57,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/AIFansX/egress-check/main/ip.s
 - IPv4 / IPv6 解析不再依赖 awk 的区间正则，支持旧版 mawk 和 BusyBox awk；IPv4 检查四段范围，IPv6 支持压缩写法及等价地址比较。
 - 能使用 `getent ahostsv4/ahostsv6` 时，先选取一个目标地址并对该地址探测，避免域名多地址或 DNS 变化导致目标判断不一致。没有可用解析结果时仍探测域名，但保守排除最后一个响应地址，不将其直接认定为公网中间跳。
 - 只有确认目标地址实际回应、且没有可见公网中间跳时，才显示「路径隐藏 / 仅目标可见」。目标延迟也只取已确认目标的响应；无法确认时为 `-` / JSON `null`。
-- 解析失败、探测失败、没有可见公网中间跳分别显示原因。JSON 保留 `ok` / `hidden` / `down` 状态，并为 `down` 增加 `reason`：`parse_error`、`probe_failed` 或 `no_public_hop`。`down` 仍计入失败统计并导致退出码 2。
+- 解析失败、探测失败、没有可见公网中间跳分别显示原因。JSON 区分 `ok` / `hidden` / `partial` / `down` 状态；路径失败时提供 `reason`，详见下文。
 - MTR 始终使用数值地址模式，避免反向 DNS 等待；已确认的公网路径或「仅目标可见」立即返回。明确的格式、权限或命令错误不重复探测；未确认结果默认最多探测两次。
 - `MTR_TOTAL_TIMEOUT` 默认 12 秒，共享于目标解析及所有 MTR 尝试，`MTR_TIMEOUT` 仍控制单次上限。目标预解析最多占用 3 秒；超时终止另有最多 1 秒的强制结束宽限，不再按轮次额外休眠。
 - `EGRESS_DEBUG_MTR=1` 的日志按尝试次数保存，包含探测地址、单次时间限制、退出状态和错误输出。超时返回的有效中间跳仍可用于路径观察。
@@ -71,6 +71,7 @@ MTR 未安装、权限不足、报告解析失败或没有确认目标延迟时�
 - 单次请求默认 `LATENCY_TIMEOUT=3` 秒；外层守护多留 1 秒以收集 curl 超时后的计时输出，并有 1 秒强制结束宽限。TCP 未连接成功时显示未知，不伪造为 `0ms`。
 - 终端在数值后标记 `TCP`；JSON 新增 `latency_source`（`mtr` / `tcp_connect` / `null`）和 `latency_port`（TCP 为 443，否则为 `null`）。TCP 建连耗时不等同于 MTR RTT，也不代表 TLS/HTTP 服务可用。
 - 有连接延迟但没有路径证据时，JSON 为 `status:"partial"`，保留路径失败 `reason`（新增 `mtr_unavailable`），ASN、首跳和分流结论保持 `null`。汇总单列 `partial` /「仅延迟」，不计入 `down`；路径和连接都失败才计入 `down`。
+- 路径失败原因包括 `mtr_unavailable`、`parse_error`、`probe_failed` 和 `no_public_hop`。顶层 `split_routing_detected` 在已检测到多条线路时为 `true`；结果完整且只有一条线路时为 `false`；其余证据不足的情况为 `null`。
 - 退出码 2 表示仍有路径探测不完整，包括 `partial`，不意味着该域名的 TCP 连接失败。已有 MTR 路径但缺少目标延迟时，也可补充 TCP 延迟，同时保留路径结果。
 
 例如：`MTR_TOTAL_TIMEOUT=8 LATENCY_TIMEOUT=2 bash ip.sh -4` 可进一步缩短每个域名的探测等待。ASN 查询、出口检测及显示不包含在 MTR 时间预算中。

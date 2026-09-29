@@ -517,6 +517,8 @@ esac
                     summary = data['ipv4']['summary']
                     self.assertEqual(summary[status], 2)
                     self.assertEqual(summary['total'], 2)
+                    if status != 'ok':
+                        self.assertIsNone(data['ipv4']['split_routing_detected'])
                     self.assertEqual(len((directory / 'tcp-calls').read_text().splitlines()), 2)
                     if mode == 'missing':
                         self.assertFalse((directory / 'mtr-calls').exists())

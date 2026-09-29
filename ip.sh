@@ -1208,7 +1208,7 @@ run_check_pass() {
         if [[ $split_idx -ge 1 ]]; then
             printf "  %s%s %s检测到分流: %d 条非默认线路, %d 个域名被分流到其他出口%s\n" "$BOLD" "$SYM_WARN" "$YELLOW" "$split_idx" "$split_domain_count" "$R"
         else
-            printf "  %s%s %s所有域名走同一出口 (AS%s) — 未检测到分流%s\n" "$BOLD" "$SYM_INFO" "$GREEN" "${effective_base_asn:-?}" "$R"
+            printf "  %s%s %s已识别路径的域名走同一出口 (AS%s) — 未检测到分流%s\n" "$BOLD" "$SYM_INFO" "$GREEN" "${effective_base_asn:-?}" "$R"
         fi
 
         if [[ ${#path_order[@]} -gt 0 ]]; then
@@ -1323,7 +1323,9 @@ build_pass_obj() {
     if [[ "$ran" == "1" ]]; then
         local ok down hidden partial routes
         eval "ok=\${${prefix}_OK}"; eval "down=\${${prefix}_DOWN}"; eval "hidden=\${${prefix}_HIDDEN}"; eval "partial=\${${prefix}_PARTIAL}"; eval "routes=\${${prefix}_ROUTE_COUNT}"
-        local split="false"; [[ $routes -ge 2 ]] && split="true"
+        local split="null"
+        if [[ $routes -ge 2 ]]; then split="true"
+        elif [[ $ok -gt 0 && $hidden -eq 0 && $down -eq 0 && $partial -eq 0 ]]; then split="false"; fi
         jq -n --argjson ok "$ok" --argjson dn "$down" --argjson hidden "$hidden" --argjson partial "$partial" --argjson rc "$routes" --argjson split "$split" --slurpfile r "$tmp_file" \
             '{available:true, summary:{total:($ok+$hidden+$partial+$dn), ok:$ok, hidden:$hidden, partial:$partial, down:$dn}, route_count:$rc, split_routing_detected:$split, results:$r[0]}'
     else
