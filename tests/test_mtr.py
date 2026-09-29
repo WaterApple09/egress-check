@@ -182,16 +182,15 @@ cat "$D/calls"
             result = self.shell('D=' + shlex.quote(tmp) + '\n' + body)
             return result.splitlines()
 
-    def test_parse_error_stops_immediately(self):
-        self.assertEqual(self.probe(['bad report']), ['__PARSE_ERROR__\t-\t', '1'])
+    def test_parse_error_gets_one_compatibility_attempt(self):
+        self.assertEqual(self.probe(['bad report'] * 2), ['__PARSE_ERROR__\t-\t', '2'])
 
     def test_hidden_stops_immediately(self):
         self.assertEqual(self.probe([report(row('104.18.33.45'))]), ['__HIDDEN__\t9.0\t', '1'])
 
-    def test_unconfirmed_can_retry_once(self):
+    def test_unconfirmed_does_not_retry(self):
         result = self.probe([report(row('???', loss='100')), report(row('168.95.98.254'), row('104.18.33.45'))])
-        self.assertTrue(result[0].startswith('168.95.98.254\t9.0'))
-        self.assertEqual(result[1], '2')
+        self.assertEqual(result, ['__UNCONFIRMED__\t-\t', '1'])
 
     def test_command_failure_never_hidden(self):
         result = self.probe([report(row('104.18.33.45'))] * 2, [124] * 2)
@@ -206,7 +205,7 @@ cat "$D/calls"
         self.assertEqual(result, ['__MTR_UNAVAILABLE__\t-\t', '1'])
 
     def test_no_response_retained(self):
-        self.assertEqual(self.probe([report(row('???', loss='100'))] * 2), ['__UNCONFIRMED__\t-\t', '2'])
+        self.assertEqual(self.probe([report(row('???', loss='100'))] * 2), ['__UNCONFIRMED__\t-\t', '1'])
 
     def test_markers_never_sent_to_asn_lookup(self):
         for marker in ('__HIDDEN__', '__PARSE_ERROR__', '__UNCONFIRMED__', '__PROBE_FAILED__'):
@@ -246,6 +245,8 @@ printf '%s\\n%s' "$rc" "$out"
         result = self.shell(body)
         self.assertTrue(result.startswith('7\n'))
         self.assertIn('-n', result)
+        self.assertIn('-w', result)
+        self.assertIn('-o L S N A B W V', result)
         self.assertNotIn('-b', result)
         self.assertIn('104.18.33.45', result)
         self.assertIn('mtr_error', result)
@@ -502,7 +503,7 @@ esac
                                MTR_ATTEMPTS='2', MTR_CONCURRENCY='2')
                     args = ['bash', str(ROOT / 'ip.sh'), '-4', '--json' if output_json else '--no-color']
                     result = subprocess.run(args, text=True, capture_output=True, env=env, timeout=20)
-                    self.assertEqual(result.returncode, 0 if status == 'ok' else 2, result.stderr)
+                    self.assertEqual(result.returncode, 2 if status == 'down' else 0, result.stderr)
                     data = json.loads((directory / 'cache' / 'last.json').read_text())
                     for item in data['ipv4']['results']:
                         self.assertEqual(item['status'], status)
@@ -530,6 +531,72 @@ esac
                         self.assertIn('50.0ms TCP', result.stdout)
                         if status == 'partial':
                             self.assertIn('仅连接延迟，路径不可用', result.stdout)
+
+
+    def test_waiting_records_without_statistics(self):
+        for placeholder in ('(waiting for reply)', '???', '*'):
+            with self.subTest(placeholder=placeholder):
+                self.assertEqual(self.parse(report(placeholder, row('104.18.33.45'))),
+                                 ['__HIDDEN__', '9.0', ''])
+                self.assertEqual(self.parse(report(placeholder))[0], '__UNCONFIRMED__')
+
+    def test_reordered_header_columns(self):
+        data = ('HOST: source Avg Snt Loss%\n'
+                '1. router.example (168.95.98.254) 1.2 3 0.0%\n'
+                '2. 104.18.33.45 8.5 3 0.0%\n')
+        self.assertEqual(self.parse(data), ['168.95.98.254', '8.5', '168.95.98.254'])
+
+    def test_long_ipv6_and_asn_prefix(self):
+        target = '2606:4700:1234:5678:9abc:def0:1234:5678'
+        data = report(row('AS123 2001:4860:1234:5678:9abc:def0:1234:5678'), row(target))
+        self.assertEqual(self.parse(data, target, '-6')[0:2],
+                         ['2001:4860:1234:5678:9abc:def0:1234:5678', '9.0'])
+
+    def test_bad_hop_keeps_confirmed_target_timing(self):
+        data = report('broken row', row('104.18.33.45', avg='8.5'))
+        self.assertEqual(self.parse(data), ['__PARSE_ERROR__', '8.5', ''])
+        self.assertEqual(self.probe([data, 'bad report']), ['__PARSE_ERROR__\t8.5\t', '2'])
+        self.assertEqual(self.probe([data, report('???')]), ['__PARSE_ERROR__\t8.5\t', '2'])
+
+    def test_compatibility_report_can_recover(self):
+        result = self.probe(['bad report', report(row('router (168.95.98.254)'), row('target (104.18.33.45)'))])
+        self.assertEqual(result, ['168.95.98.254\t9.0\t168.95.98.254', '2'])
+
+    def test_parse_diagnostic_identifies_first_bad_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'parse.txt')
+            data = report('bad row', 'another bad row', row('104.18.33.45'))
+            self.shell('parse_mtr_report -4 104.18.33.45 ' + shlex.quote(path), data)
+            diagnostic = Path(path).read_text()
+            self.assertIn('parse_reason: missing header or statistics', diagnostic)
+            self.assertIn('1.|-- bad row', diagnostic)
+            self.assertNotIn('another bad row', diagnostic)
+
+    def test_confirmed_mtr_latency_skips_tcp_after_parse_failure(self):
+        body = r"""
+first_public_hop() { printf '__PARSE_ERROR__\t8.5\t'; }
+tcp_connect_latency() { echo unexpected >&2; exit 99; }
+probe_domain -4 example.com
+"""
+        self.assertEqual(self.shell(body), '__PARSE_ERROR__\t8.5\t\tmtr')
+
+    @unittest.skipUnless(os.environ.get('EGRESS_TEST_REAL_MTR') == '1', 'CI opt-in: real loopback MTR')
+    def test_real_mtr_loopback_report(self):
+        command = ['mtr', '-4', '-r', '-w', '-n', '-c', '1', '-G', '1', '-o', 'L S N A B W V', '127.0.0.1']
+        if os.geteuid() != 0:
+            command = ['sudo', '-n'] + command
+        result = subprocess.run(command, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = self.parse(result.stdout, '127.0.0.1')
+        self.assertEqual(parsed[0], '__HIDDEN__', result.stdout)
+        self.assertGreaterEqual(float(parsed[1]), 0)
+
+    def test_release_version_and_executable_links(self):
+        readme = (ROOT / 'README.md').read_text()
+        self.assertIn('VERSION="2.19"', SOURCE)
+        self.assertIn('## v2.19 修复', readme)
+        self.assertNotIn('raw.githubusercontent.com/AIFansX/', readme)
+        self.assertNotIn('git clone https://github.com/AIFansX/', readme)
 
 
 if __name__ == '__main__':
