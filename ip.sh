@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 家宽VPS分流一键自查检测 Egress-Check v2.19      鸣谢：https://ip.net.coffee
+# 家宽VPS分流一键自查检测 Egress-Check v2.20      鸣谢：https://ip.net.coffee
 #
 # 用 mtr 取每个域名的"第一个公网跳", 按 ASN 自动分组上色, 直接可视化线路分流.
 # 不同 ASN = 不同出口线路 = 商家做了分流. 一眼看出分了几条线, 哪些域名走哪条.
@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="2.19"
+VERSION="2.20"
 BRAND_URL="https://ip.net.coffee"
 
 # ─── 颜色 ──────────────────────────────────────────────────────────────────
@@ -52,6 +52,8 @@ fi
 
 PASS_MODE="auto"
 OUTPUT_JSON=0
+MASK_IP="${EGRESS_MASK_IP:-0}"
+MASK_IPV4_LIST=""
 INTERACTIVE=0
 ONLY_CAT=""
 MTR_TIMEOUT="${MTR_TIMEOUT:-20}"
@@ -218,6 +220,7 @@ Usage: $(basename "$0") [options]
   -4, --ipv4     只跑 IPv4
   -6, --ipv6     只跑 IPv6
   --json         JSON 输出
+  --mask-ip      本机 IPv4 出口和 IPv4 MTR 首跳显示为 a.b.*.*
   --no-color     关闭颜色
   --low-resource 低并发低压力模式
   --only <CAT>   只跑指定分类
@@ -276,6 +279,7 @@ while [[ $# -gt 0 ]]; do
         -4|--ipv4)  PASS_MODE="v4-only" ;;
         -6|--ipv6)  PASS_MODE="v6-only" ;;
         --json)     OUTPUT_JSON=1 ;;
+        --mask-ip)  MASK_IP=1 ;;
         --no-color) USE_COLOR=0; set_colors ;;
         --low-resource)
             MTR_CONCURRENCY="${MTR_CONCURRENCY:-$(default_mtr_concurrency)}"
@@ -290,6 +294,9 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+if [[ "$MASK_IP" != 0 && "$MASK_IP" != 1 ]]; then
+    err "EGRESS_MASK_IP 必须为 0 或 1"; exit 1
+fi
 [[ $INTERACTIVE -eq 1 ]] && interactive_menu
 
 if [[ $USE_COLOR -eq 1 ]]; then
@@ -396,16 +403,75 @@ if ! install -d -m 700 "$CACHE_DIR" 2>/dev/null; then
     err "无法创建/访问 cache 目录: $CACHE_DIR"; exit 1
 fi
 [[ -O "$CACHE_DIR" ]] && chmod 700 "$CACHE_DIR" 2>/dev/null || true
+# Each invocation owns its temporary files, including unredacted probe data.
+RUN_DIR="$(mktemp -d "$CACHE_DIR/.run.XXXXXXXX")"
+cleanup_tmp() {
+    [[ -n "${RUN_DIR:-}" ]] && rm -rf -- "$RUN_DIR"
+    return 0
+}
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; trap cleanup_tmp EXIT
+MTR_DEBUG_DIR="$CACHE_DIR/mtr-debug"
+[[ "$MASK_IP" == 1 ]] && MTR_DEBUG_DIR="$RUN_DIR/mtr-debug"
 IP_LOOKUP_CACHE_DIR="$CACHE_DIR/ip-lookup"
 if ! install -d -m 700 "$IP_LOOKUP_CACHE_DIR" 2>/dev/null; then
     err "无法创建/访问 IP 反查缓存目录: $IP_LOOKUP_CACHE_DIR"; exit 1
 fi
 [[ -O "$IP_LOOKUP_CACHE_DIR" ]] && chmod 700 "$IP_LOOKUP_CACHE_DIR" 2>/dev/null || true
 if [[ "${EGRESS_DEBUG_MTR:-0}" == 1 && "$MTR_AVAILABLE" == 1 ]]; then
-    if install -d -m 700 "$CACHE_DIR/mtr-debug" 2>/dev/null; then
-        LC_ALL=C timeout -k 1 1 mtr --version > "$CACHE_DIR/mtr-debug/version.txt" 2>&1 || true
+    if install -d -m 700 "$MTR_DEBUG_DIR" 2>/dev/null; then
+        LC_ALL=C timeout -k 1 1 mtr --version > "$MTR_DEBUG_DIR/version.txt" 2>&1 || true
     fi
 fi
+
+# Only the selected IPv4 addresses are masked; routing always uses originals.
+prepare_mask_ipv4() {
+    MASK_IPV4_LIST="${V4_IP:-} ${V4_MTR_BASE_HOP:-}"
+    local entry
+    for entry in ${V4_ECHO_DETAIL//;/ }; do
+        [[ "$entry" == *@* ]] && MASK_IPV4_LIST+=" ${entry%%@*}"
+    done
+    return 0
+}
+mask_ip() {
+    local ip="$1"
+    if [[ "${MASK_IP:-0}" == 1 && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        case " ${MASK_IPV4_LIST:-} " in
+            *" $ip "*) printf '%s.*.*' "${ip%.*.*}"; return ;;
+        esac
+    fi
+    printf '%s' "$ip"
+}
+mask_ipv4_text() {
+    if [[ "${MASK_IP:-0}" != 1 ]]; then cat; return; fi
+    LC_ALL=C awk -v ips="${MASK_IPV4_LIST:-}" '
+        BEGIN { n=split(ips,a," "); for(i=1;i<=n;i++) if(a[i]!="") selected[a[i]]=1 }
+        {
+            rest=$0; out=""
+            while(match(rest,/[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+/)) {
+                before=substr(rest,1,RSTART-1); ip=substr(rest,RSTART,RLENGTH)
+                after=substr(rest,RSTART+RLENGTH)
+                if ((ip in selected) && before !~ /[0-9.]$/ && before !~ /[0-9a-fA-F:]:$/ && after !~ /^[0-9.]/) {
+                    split(ip,parts,"."); ip=parts[1] "." parts[2] ".*.*"
+                }
+                out=out before ip; rest=after
+            }
+            print out rest
+        }'
+}
+publish_masked_debug() {
+    [[ "${MASK_IP:-0}" == 1 && -d "$MTR_DEBUG_DIR" ]] || return 0
+    local destination file name index=0
+    install -d -m 700 "$CACHE_DIR/mtr-debug-masked"
+    destination="$(mktemp -d "$CACHE_DIR/mtr-debug-masked/run.XXXXXXXX")"
+    for file in "$MTR_DEBUG_DIR"/*.txt; do
+        [[ -f "$file" ]] || continue
+        index=$((index+1))
+        name="$(printf '%s' "${file##*/}" | mask_ipv4_text)"
+        # Numeric prefixes avoid collisions when two masked names become equal.
+        mask_ipv4_text < "$file" > "$destination/$index-$name"
+        chmod 600 "$destination/$index-$name"
+    done
+}
 
 sanitize() { LC_ALL=C tr -d '\000-\037\177'; }
 strip_bom() { local s="$1"; s="${s#$'\xef\xbb\xbf'}"; printf '%s' "$s"; }
@@ -536,6 +602,8 @@ read_ip_lookup_cache() {
     printf '%s' "$line"
 }
 write_ip_lookup_cache() {
+    # Existing cache may be read, but privacy mode must not create raw IP names.
+    [[ "${MASK_IP:-0}" == 1 ]] && return 0
     local ip="$1" result="$2" path tmp
     [[ "$(lookup_score "$result")" -ge 3 ]] || return 0
     path="$(ip_lookup_cache_path "$ip")"
@@ -780,7 +848,7 @@ first_public_hop() {
         output="$(run_mtr_report "$ip_flag" "$destination" "$limit" "$mode" 2>&1)" || rc=$?
         if [[ "${EGRESS_DEBUG_MTR:-0}" == "1" ]]; then
             local dbg_dir dbg_file safe_domain
-            dbg_dir="$CACHE_DIR/mtr-debug"
+            dbg_dir="${MTR_DEBUG_DIR:-$CACHE_DIR/mtr-debug}"
             install -d -m 700 "$dbg_dir" 2>/dev/null || true
             safe_domain="$(printf '%s' "$domain" | sed 's/[^A-Za-z0-9_.-]/_/g')"
             dbg_file="$dbg_dir/${ip_flag#-}-${safe_domain}-${attempt}-${mode}.txt"
@@ -926,14 +994,6 @@ fi
 TOTAL=${#DOMAINS[@]}
 [[ $TOTAL -eq 0 ]] && { err "规则中没有可用域名 (或 --only 过滤后为空)"; exit 1; }
 
-TMP_V4_RESULTS=""; TMP_V6_RESULTS=""; FINAL_JSON=""
-cleanup_tmp() {
-    [[ -n "$TMP_V4_RESULTS" ]] && rm -f -- "$TMP_V4_RESULTS"
-    [[ -n "$TMP_V6_RESULTS" ]] && rm -f -- "$TMP_V6_RESULTS"
-    [[ -n "$FINAL_JSON" ]] && rm -f -- "$FINAL_JSON"
-    rm -rf "$CACHE_DIR"/.mtrout.* 2>/dev/null || true
-}
-trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; trap cleanup_tmp EXIT
 
 is_tty() { [[ -t 1 && $USE_COLOR -eq 1 ]]; }
 repeat_char() { local c="$1" w="$2" r; printf -v r "%${w}s" ""; printf '%s' "${r// /$c}"; }
@@ -954,10 +1014,10 @@ print_env_section() {
         ipv6) printf "    默认出口     %sIPv6%s  %s\n" "$GREEN" "$R" "$SYM_STAR" ;;
         *)    printf "    默认出口     %s无网络出口%s\n" "$RED" "$R" ;;
     esac
-    if [[ -n "$v4" ]]; then printf "    IPv4 出口    %s%s%s  %s%s%s\n" "$BOLD" "$v4" "$R" "$DIM" "$v4info" "$R"
+    if [[ -n "$v4" ]]; then printf "    IPv4 出口    %s%s%s  %s%s%s\n" "$BOLD" "$(mask_ip "$v4")" "$R" "$DIM" "$v4info" "$R"
     else printf "    IPv4 出口    %s不可用%s\n" "$RED" "$R"; fi
     if [[ -n "${V4_MTR_BASE_ASN:-}" ]]; then
-        printf "    IPv4 MTR     %s%s%s  %s%s%s\n" "$BOLD" "$V4_MTR_BASE_HOP" "$R" "$DIM" "$V4_MTR_BASE_INFO" "$R"
+        printf "    IPv4 MTR     %s%s%s  %s%s%s\n" "$BOLD" "$(mask_ip "$V4_MTR_BASE_HOP")" "$R" "$DIM" "$V4_MTR_BASE_INFO" "$R"
     fi
     if [[ -n "$v6" ]]; then printf "    IPv6 出口    %s%s%s  %s%s%s\n" "$BOLD" "$v6" "$R" "$DIM" "$v6info" "$R"
     else printf "    IPv6 出口    %s不可用 / 已禁用%s\n" "$YELLOW" "$R"; fi
@@ -967,9 +1027,10 @@ print_env_section() {
     local item
     if [[ -n "$v4" && $V4_ECHO_UNIQUE -gt 1 ]]; then
         printf "\n    %s%s 商家 SNAT 嫌疑%s — %s%d 个回声服务看到不同对外 IP%s\n" "$RED" "$SYM_WARN" "$R" "$DIM" "$V4_ECHO_UNIQUE" "$R"
-        local IFS_save="$IFS"; IFS=';'
-        for item in $V4_ECHO_DETAIL; do item="${item# }"; printf "      %s· %s%s\n" "$DIM" "$item" "$R"; done
-        IFS="$IFS_save"
+        local echo_display; echo_display="$(printf '%s' "$V4_ECHO_DETAIL" | mask_ipv4_text)"
+        local -a echo_items=()
+        IFS=';' read -r -a echo_items <<< "$echo_display"
+        for item in "${echo_items[@]}"; do item="${item# }"; printf "      %s· %s%s\n" "$DIM" "$item" "$R"; done
     fi
 }
 print_pass_header() {
@@ -1041,6 +1102,7 @@ path_asn_chain() {
 print_result_row() {
     [[ $OUTPUT_JSON -eq 1 ]] && return 0
     local marker="$1" domain="$2" ip="$3" latency="$4" cc="$5" asn="$6" isp="$7" is_split="${8:-0}" asn_isp latency_disp
+    ip="$(mask_ip "$ip")"
     [[ "$asn" == "??" || "$asn" == "null" ]] && asn=""
     [[ "$isp" == "null" ]] && isp="Unknown"
     if [[ -z "$asn" ]]; then asn_isp="$isp"; else asn_isp="AS${asn} ${isp}"; fi
@@ -1124,7 +1186,7 @@ run_check_pass() {
         printf "    %s %s%s%s\n" "$SYM_INFO" "$CYAN" "$topology_note" "$R"
         printf "      %sHTTP出口仍用于展示真实对外 IP；MTR 用于比较不同域名的路由路径%s\n" "$DIM" "$R"
     fi
-    local out_dir; out_dir="$(mktemp -d "$CACHE_DIR/.mtrout.XXXXXX")"
+    local out_dir; out_dir="$(mktemp -d "${RUN_DIR:-$CACHE_DIR}/.mtrout.XXXXXX")"
     local -A cat_idxs=(); local -a cat_order=()
     local gi
     for gi in "${!DOMAINS[@]}"; do
@@ -1223,10 +1285,10 @@ run_check_pass() {
         local split_json="false"; [[ $is_split -eq 1 ]] && split_json="true"
         local latency_json="null"; [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]] && latency_json="$latency"
         if [[ -z "$asn" ]]; then
-            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$hop" --argjson lat "$latency_json" --arg source "$latency_source" --arg chain "$path_chain" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
+            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$(mask_ip "$hop")" --argjson lat "$latency_json" --arg source "$latency_source" --arg chain "$path_chain" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
                 '{category:$c, domain:$d, status:"ok", first_hop:$h, latency_ms:$lat, latency_source:($source | if . == "" then null else . end), latency_port:(if $source == "tcp_connect" then 443 else null end), path_asn_chain:($chain | if . == "" then null else . end), asn:null, isp:$isp, country:$cc, split:$sp, note:$note}' >> "$tmp_file"
         else
-            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$hop" --argjson lat "$latency_json" --arg source "$latency_source" --arg chain "$path_chain" --arg asn "$asn" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
+            jq -n --arg c "$cat_v" --arg d "$domain" --arg h "$(mask_ip "$hop")" --argjson lat "$latency_json" --arg source "$latency_source" --arg chain "$path_chain" --arg asn "$asn" --arg isp "$isp" --arg cc "$country" --argjson sp "$split_json" --arg note "$note" \
                 '{category:$c, domain:$d, status:"ok", first_hop:$h, latency_ms:$lat, latency_source:($source | if . == "" then null else . end), latency_port:(if $source == "tcp_connect" then 443 else null end), path_asn_chain:($chain | if . == "" then null else . end), asn:("AS"+$asn), isp:$isp, country:$cc, split:$sp, note:$note}' >> "$tmp_file"
         fi
         done
@@ -1248,7 +1310,7 @@ run_check_pass() {
                 local dlist="${route_domains[$key]}"
                 local dcount; dcount=$(printf '%s\n' $dlist | wc -l | tr -d ' ')
                 local asn_disp="$key"
-                [[ "$key" == ip:* ]] && asn_disp="${key#ip:}" || asn_disp="AS$key"
+                [[ "$key" == ip:* ]] && asn_disp="$(mask_ip "${key#ip:}")" || asn_disp="AS$key"
                 local marker tag tagcol
                 if [[ "${route_split[$key]}" == "1" ]]; then
                     marker="${SPLIT_COLORS[${route_scidx[$key]} % split_color_n]}●${R}"; tag="⚠ 存在分流"; tagcol="$YELLOW"
@@ -1353,10 +1415,11 @@ fi
 if [[ -n "$V6_IP" && ( "$PASS_MODE" == "auto" || "$PASS_MODE" == "v6-only" ) ]]; then
     detect_mtr_base_asn "-6" "V6" || true
 fi
+prepare_mask_ipv4
 [[ $OUTPUT_JSON -eq 0 && "$PASS_MODE" == "auto" ]] && print_env_section "$DEFAULT_EGRESS" "$V4_IP" "$V6_IP" "$V4_INFO" "$V6_INFO"
 [[ $OUTPUT_JSON -eq 0 ]] && printf "\n  %s共 %d 个域名, 按分类逐组检测 (绿●=默认出口, 彩色●=分流)%s\n" "$DIM" "$TOTAL" "$R"
-TMP_V4_RESULTS="$(mktemp "$CACHE_DIR/.tmp-v4.XXXXXXXX")"
-TMP_V6_RESULTS="$(mktemp "$CACHE_DIR/.tmp-v6.XXXXXXXX")"
+TMP_V4_RESULTS="$(mktemp "$RUN_DIR/.tmp-v4.XXXXXXXX")"
+TMP_V6_RESULTS="$(mktemp "$RUN_DIR/.tmp-v6.XXXXXXXX")"
 chmod 600 "$TMP_V4_RESULTS" "$TMP_V6_RESULTS"
 V6_SKIP_REASON=""
 case "$PASS_MODE" in
@@ -1379,7 +1442,7 @@ if [[ $OUTPUT_JSON -eq 0 ]]; then
     else printf "  IPv6:  %s skipped  %s%s%s\n" "$SYM_SKIP" "$DIM" "${V6_SKIP_REASON:-}" "$R"; fi
     printf "  %selapsed:%s %s\n" "$DIM" "$R" "$ELAPSED_STR"; rule_double 72
 fi
-FINAL_JSON="$(mktemp "$CACHE_DIR/.tmp-final.XXXXXXXX")"; chmod 600 "$FINAL_JSON"
+FINAL_JSON="$(mktemp "$RUN_DIR/.tmp-final.XXXXXXXX")"; chmod 600 "$FINAL_JSON"
 build_pass_obj() {
     local prefix="$1" ran="$2" tmp_file="$3" skip_reason="$4"
     if [[ "$ran" == "1" ]]; then
@@ -1397,15 +1460,17 @@ build_pass_obj() {
 V4_PASS_JSON="$(build_pass_obj V4 "$V4_PASS_RAN" "$TMP_V4_RESULTS" "IPv4 出口不可用")"
 V6_PASS_JSON="$(build_pass_obj V6 "$V6_PASS_RAN" "$TMP_V6_RESULTS" "${V6_SKIP_REASON:-IPv6 出口不可用或已禁用}")"
 jq -n --arg ts "$START_TS" --arg host "$HOST_NAME" --arg ver "$VERSION" --arg defegr "$DEFAULT_EGRESS" \
-    --arg v4ip "$V4_IP" --arg v4info "$V4_INFO" --arg v6ip "$V6_IP" --arg v6info "$V6_INFO" \
-    --arg v4echo "$V4_ECHO_DETAIL" --arg v6echo "$V6_ECHO_DETAIL" \
+    --arg v4ip "$(mask_ip "$V4_IP")" --arg v4info "$V4_INFO" --arg v6ip "$V6_IP" --arg v6info "$V6_INFO" \
+    --arg v4echo "$(printf '%s' "$V4_ECHO_DETAIL" | mask_ipv4_text)" --arg v6echo "$V6_ECHO_DETAIL" \
     --argjson v4uniq "$V4_ECHO_UNIQUE" --argjson v6uniq "$V6_ECHO_UNIQUE" \
+    --argjson ip_masked "$([[ "$MASK_IP" == 1 ]] && printf true || printf false)" \
     --argjson elapsed "$ELAPSED" --argjson v4 "$V4_PASS_JSON" --argjson v6 "$V6_PASS_JSON" \
-    '{ timestamp:$ts, host:$host, version:$ver, elapsed_seconds:$elapsed,
+    '{ timestamp:$ts, host:$host, version:$ver, ip_masked:$ip_masked, elapsed_seconds:$elapsed,
        env:{ default_egress:$defegr,
          ipv4:{ip:(if $v4ip=="" then null else $v4ip end), info:$v4info, echo_unique_count:$v4uniq, echo_detail:(if $v4echo=="" then null else $v4echo end), snat_suspected:($v4uniq>1)},
          ipv6:{ip:(if $v6ip=="" then null else $v6ip end), info:$v6info, echo_unique_count:$v6uniq, echo_detail:(if $v6echo=="" then null else $v6echo end), snat_suspected:($v6uniq>1)} },
        ipv4:$v4, ipv6:$v6 }' > "$FINAL_JSON"
+publish_masked_debug
 [[ $OUTPUT_JSON -eq 1 ]] && cat "$FINAL_JSON"
 LAST_JSON="$CACHE_DIR/last.json"
 if mv -f -- "$FINAL_JSON" "$LAST_JSON" 2>/dev/null; then chmod 600 "$LAST_JSON" 2>/dev/null || true; FINAL_JSON=""

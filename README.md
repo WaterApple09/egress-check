@@ -52,6 +52,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main
 
 ![Egress-Check 分流检测效果图](assets/egress-check-preview.png)
 
+## v2.20 新增
+
+- 新增 `--mask-ip` / `EGRESS_MASK_IP=1`，将本机 IPv4 出口和界面 IPv4 MTR 首跳的后两段显示为 `*.*`
+- 同步脱敏终端、JSON / `last.json` 与本次调试日志，不改变实际探测、ASN 查询和分流判断；主机名、IPv6 及其他节点保持原样
+- 脱敏模式不新增 IP 查询缓存，原始中间结果使用本次运行专属临时目录，退出只清理本次文件
+
 ## v2.19 修复
 
 - 修复旧版 mawk / BusyBox awk 下公网跳识别失败的问题，兼容 IPv4、压缩 IPv6 和等价地址写法
@@ -203,6 +209,8 @@ cp rules.conf.example rules.conf
 ./ip.sh --only Social   # 只跑某个分类
 ./ip.sh --json          # JSON 输出
 ./ip.sh --no-color      # 关闭颜色
+./ip.sh --mask-ip       # 隐藏指定 IPv4 的后两段
+./ip.sh --mask-ip --json # 脱敏 JSON
 ./ip.sh --low-resource  # 低并发低压力模式
 
 MTR_CONCURRENCY=10 ./ip.sh
@@ -214,6 +222,19 @@ EGRESS_BASE_MODE=echo ./ip.sh
 ./ip.sh --low-resource
 MTR_CONCURRENCY=2 MTR_COUNT=2 ./ip.sh
 ```
+
+需要分享结果时，使用 `--mask-ip`，也可设置 `EGRESS_MASK_IP=1`（默认 `0`）：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/WaterApple09/egress-check/main/ip.sh) --mask-ip
+EGRESS_MASK_IP=1 ./ip.sh --json
+```
+
+例如 `61.228.67.223` 显示为 `61.228.*.*`，地址根据实际检测动态处理。范围包括所有出口回声服务返回的本机 IPv4，以及界面「IPv4 MTR」的首个可见公网跳；相同 IP 在域名首跳结果中也会遮盖。其他 IPv4 节点、主机名、IPv6、ASN、延迟和分流判断不变。JSON 新增 `ip_masked` 标记，`last.json` 保存与输出一致的结果。
+
+脱敏模式的调试日志在检测结束后写入 `~/.cache/egress-check/mtr-debug-masked/run.*/`，包括文件名和解析诊断；已有 `mtr-debug/` 和 IP 查询缓存不会追溯脱敏或删除。此模式仍可读取原缓存，但不新增 IP 查询缓存。运行中的原始中间结果保存在权限为 `700` 的独立临时目录，正常退出及可处理的中断会清理，断电或强制终止可能留下临时文件。不要直接打包整个缓存目录分享。
+
+这是展示脱敏，不是网络匿名：请求仍使用真实 IP，第三方出口 / ASN 服务仍可看到请求信息。保留前两段比只隐藏末段暴露更少，但仍不能保证无法定位；主机名、IPv6 和其他上下文也可能关联到服务器。
 
 如果遇到手动 `mtr` 正常、脚本却显示“探测失败 / 无公网跳”，可以开启调试：
 

@@ -31,7 +31,8 @@ def function(name):
 CORE = '\n'.join(function(n) for n in (
     'run_mtr_report', 'resolve_mtr_target', 'parse_mtr_report',
     'first_public_hop', 'detect_mtr_base_asn', 'split_tsv4',
-    'is_valid_domain', 'tcp_connect_latency', 'probe_domain'))
+    'is_valid_domain', 'tcp_connect_latency', 'probe_domain', 'mask_ip',
+    'mask_ipv4_text', 'prepare_mask_ipv4', 'publish_masked_debug'))
 
 
 def row(ip, loss='0.0', avg='9.0', sent=3):
@@ -643,10 +644,152 @@ probe_domain -4 example.com
         self.assertEqual(parsed[0], '__HIDDEN__', result.stdout)
         self.assertGreaterEqual(float(parsed[1]), 0)
 
+    def test_mask_ipv4_matches_selected_addresses_only(self):
+        body = r"""
+MASK_IP=1
+V4_IP=203.0.113.7 V4_MTR_BASE_HOP=198.51.100.9
+V4_ECHO_DETAIL='203.0.113.7@one ; 203.0.114.8@two'
+prepare_mask_ipv4
+for ip in 203.0.113.7 198.51.100.9 203.0.114.8 203.0.113.8 2001:db8::7; do
+    mask_ip "$ip"; printf '\n'
+done
+"""
+        self.assertEqual(self.shell(body).splitlines(),
+                         ['203.0.*.*', '198.51.*.*', '203.0.*.*', '203.0.113.8', '2001:db8::7'])
+
+    def test_mask_text_keeps_boundaries_and_ipv6(self):
+        body = 'MASK_IP=1 MASK_IPV4_LIST="203.0.113.7 198.51.100.9"\nmask_ipv4_text'
+        data = '203.0.113.7 (198.51.100.9) 203.0.113.70 203.0.113.7.1 ::ffff:203.0.113.7 host-name\n'
+        self.assertEqual(self.shell(body, data),
+                         '203.0.*.* (198.51.*.*) 203.0.113.70 203.0.113.7.1 ::ffff:203.0.113.7 host-name')
+        self.assertEqual(self.shell('MASK_IP=0\nmask_ipv4_text', data), data.rstrip('\n'))
+
+    def test_mask_cli_outputs_cache_and_debug_without_changing_probes(self):
+        v4_report = report(row('10.0.0.1'), row('168.95.98.254'), row('8.8.8.8'), row('104.18.33.45'))
+        other_report = report(row('168.95.99.250'), row('104.18.33.46'))
+        v6_report = report(row('2001:b030:112d:710::1'), row('2606:4700::1111'))
+        for mode in ('off', 'flag', 'env'):
+            for json_output in (True, False):
+                with self.subTest(mode=mode, json=json_output), tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp)
+                    binaries = directory / 'bin'
+                    binaries.mkdir()
+                    cache = directory / 'cache'
+                    cache.mkdir()
+                    # Existing data is not silently removed by privacy mode.
+                    old = cache / 'mtr-debug'
+                    old.mkdir()
+                    (old / 'old.txt').write_text('old private log')
+                    other_run = cache / '.mtrout.other-instance'
+                    other_run.mkdir()
+                    (other_run / 'keep').write_text('still running')
+                    (directory / 'v4').write_text(v4_report)
+                    (directory / 'other').write_text(other_report)
+                    (directory / 'v6').write_text(v6_report)
+                    # Asterisks in displayed IPs must never expand local filenames.
+                    (directory / '61.228.123.456@api.ip.sb ').write_text('not a result')
+                    (directory / 'rules').write_text('AI|example.com|||test\nAI|example.org|||test\n')
+                    scripts = {
+                        'hostname': 'printf test-host-unchanged\n',
+                        'getent': r'''case "$*" in
+  ahostsv6*) printf '2606:4700::1111 STREAM target\n' ;;
+  *example.org*) printf '104.18.33.46 STREAM target\n' ;;
+  *) printf '104.18.33.45 STREAM target\n' ;;
+esac
+''',
+                        'mtr': r'''printf '%s\n' "$*" >> "$TEST_DIR/probes"
+case "$*" in
+  *--version*) echo 'mtr test version' ;;
+  *-6*) cat "$TEST_DIR/v6" ;;
+  *104.18.33.46*) cat "$TEST_DIR/other" ;;
+  *) cat "$TEST_DIR/v4" ;;
+esac
+''',
+                        'curl': r'''printf '%s\n' "$*" >> "$TEST_DIR/probes"
+case "$*" in
+  *ipinfo.io/*/json*) printf '%s' '{"country":"TW","org":"AS3462 Test ISP"}' ;;
+  *-6*) printf '2001:b030:112d:71f::a1' ;;
+  *ifconfig.me/ip*) printf '61.228.68.224' ;;
+  *) printf '61.228.67.223' ;;
+esac
+''',
+                    }
+                    for name, script in scripts.items():
+                        executable = binaries / name
+                        executable.write_text('#!/bin/sh\n' + script)
+                        executable.chmod(0o755)
+                    env = dict(self.env, PATH=str(binaries) + os.pathsep + self.env['PATH'],
+                               EGRESS_CACHE=str(cache), EGRESS_RULES=str(directory / 'rules'),
+                               TEST_DIR=tmp, EGRESS_DEBUG_MTR='1', EGRESS_MASK_IP='1' if mode == 'env' else '0')
+                    args = ['bash', str(ROOT / 'ip.sh'), '--json' if json_output else '--no-color']
+                    if mode == 'flag':
+                        args.append('--mask-ip')
+                    result = subprocess.run(args, env=env, cwd=directory, text=True, capture_output=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn('61.228.123.456', result.stdout)
+                    data = json.loads((cache / 'last.json').read_text())
+                    masked = mode != 'off'
+                    self.assertEqual(data['ip_masked'], masked)
+                    self.assertEqual(data['host'], 'test-host-unchanged')
+                    self.assertEqual(data['env']['ipv6']['ip'], '2001:b030:112d:71f::a1')
+                    self.assertEqual(data['env']['ipv4']['ip'], '61.228.*.*' if masked else '61.228.67.223')
+                    self.assertEqual(data['env']['ipv4']['echo_unique_count'], 2)
+                    self.assertTrue(data['env']['ipv4']['snat_suspected'])
+                    self.assertEqual(data['ipv4']['summary']['ok'], 2)
+                    self.assertEqual(data['ipv4']['route_count'], 1)
+                    self.assertFalse(data['ipv4']['split_routing_detected'])
+                    first, other = data['ipv4']['results']
+                    self.assertEqual(first['first_hop'], '168.95.*.*' if masked else '168.95.98.254')
+                    self.assertEqual(other['first_hop'], '168.95.99.250')
+                    self.assertEqual(first['asn'], 'AS3462')
+                    self.assertEqual(first['latency_ms'], 9)
+                    if json_output:
+                        self.assertEqual(json.loads(result.stdout), data)
+                    else:
+                        self.assertIn('test-host-unchanged', result.stdout)
+                        self.assertIn('IPv4 MTR', result.stdout)
+                        self.assertIn('2001:b030:112d:710::1', result.stdout)
+                    sensitive = ('61.228.67.223', '61.228.68.224', '168.95.98.254')
+                    if masked:
+                        published = result.stdout + (cache / 'last.json').read_text()
+                        logs = list((cache / 'mtr-debug-masked').glob('run.*/*.txt'))
+                        self.assertTrue(logs)
+                        for log in logs:
+                            published += str(log.relative_to(cache)) + log.read_text()
+                        for ip in sensitive:
+                            self.assertNotIn(ip, published)
+                        self.assertIn('8.8.8.8', published)
+                        self.assertIn('104.18.33.45', published)
+                        self.assertFalse(list((cache / 'ip-lookup').glob('*')))
+                        self.assertEqual(list(old.iterdir()), [old / 'old.txt'])
+                    else:
+                        self.assertTrue(list((cache / 'ip-lookup').glob('*.tsv')))
+                        self.assertIn('61.228.67.223', result.stdout)
+                    # Actual network requests and independent instances are unchanged.
+                    probes = (directory / 'probes').read_text()
+                    self.assertNotIn('*.*', probes)
+                    self.assertIn('https://ipinfo.io/61.228.67.223/json', probes)
+                    self.assertIn('104.18.33.45', probes)
+                    self.assertTrue((other_run / 'keep').exists())
+                    self.assertEqual((old / 'old.txt').read_text(), 'old private log')
+                    self.assertFalse(list(cache.glob('.run.*')))
+
+    def test_mask_invalid_environment_rejected(self):
+        result = subprocess.run(['bash', str(ROOT / 'ip.sh')], env=dict(self.env, EGRESS_MASK_IP='invalid'),
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('EGRESS_MASK_IP', result.stderr)
+
+    def test_mask_flag_documented_in_help(self):
+        result = subprocess.run(['bash', str(ROOT / 'ip.sh'), '--help'], env=self.env,
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('--mask-ip', result.stdout)
+
     def test_release_version_and_executable_links(self):
         readme = (ROOT / 'README.md').read_text()
-        self.assertIn('VERSION="2.19"', SOURCE)
-        self.assertIn('## v2.19 修复', readme)
+        self.assertIn('VERSION="2.20"', SOURCE)
+        self.assertIn('## v2.20 新增', readme)
         self.assertNotIn('raw.githubusercontent.com/AIFansX/', readme)
         self.assertNotIn('git clone https://github.com/AIFansX/', readme)
 
