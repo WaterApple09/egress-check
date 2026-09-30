@@ -497,8 +497,6 @@ esac
                         executable.chmod(0o755)
                     (directory / 'report').write_text(fixture)
                     (directory / 'rules').write_text('AI|example.com|||test\nAI|example.org|||test\n')
-                    # Asterisks in displayed IPs must never expand local filenames.
-                    (directory / '61.228.123.456@api.ip.sb ').write_text('not a result')
                     env = dict(self.env, PATH=str(binaries) + os.pathsep + self.env['PATH'],
                                BASH_ENV=str(directory / 'startup.sh'), TEST_DIR=tmp, TEST_MODE=mode,
                                TEST_MTR_RC=str(mtr_rc), TEST_CURL_RC=str(curl_rc),
@@ -688,6 +686,8 @@ done
                     (directory / 'v4').write_text(v4_report)
                     (directory / 'other').write_text(other_report)
                     (directory / 'v6').write_text(v6_report)
+                    # Asterisks in displayed IPs must never expand local filenames.
+                    (directory / '61.228.123.456@api.ip.sb ').write_text('not a result')
                     (directory / 'rules').write_text('AI|example.com|||test\nAI|example.org|||test\n')
                     scripts = {
                         'hostname': 'printf test-host-unchanged\n',
