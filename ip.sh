@@ -220,6 +220,7 @@ Usage: $(basename "$0") [options]
   -4, --ipv4     只跑 IPv4
   -6, --ipv6     只跑 IPv6
   --json         JSON 输出
+  --mask-ip      本机 IPv4 出口和 IPv4 MTR 首跳显示为 a.b.*.*
   --no-color     关闭颜色
   --low-resource 低并发低压力模式
   --only <CAT>   只跑指定分类
@@ -1026,10 +1027,10 @@ print_env_section() {
     local item
     if [[ -n "$v4" && $V4_ECHO_UNIQUE -gt 1 ]]; then
         printf "\n    %s%s 商家 SNAT 嫌疑%s — %s%d 个回声服务看到不同对外 IP%s\n" "$RED" "$SYM_WARN" "$R" "$DIM" "$V4_ECHO_UNIQUE" "$R"
-        local IFS_save="$IFS"; IFS=';'
         local echo_display; echo_display="$(printf '%s' "$V4_ECHO_DETAIL" | mask_ipv4_text)"
-        for item in $echo_display; do item="${item# }"; printf "      %s· %s%s\n" "$DIM" "$item" "$R"; done
-        IFS="$IFS_save"
+        local -a echo_items=()
+        IFS=';' read -r -a echo_items <<< "$echo_display"
+        for item in "${echo_items[@]}"; do item="${item# }"; printf "      %s· %s%s\n" "$DIM" "$item" "$R"; done
     fi
 }
 print_pass_header() {

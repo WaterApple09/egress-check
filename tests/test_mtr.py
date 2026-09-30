@@ -497,6 +497,8 @@ esac
                         executable.chmod(0o755)
                     (directory / 'report').write_text(fixture)
                     (directory / 'rules').write_text('AI|example.com|||test\nAI|example.org|||test\n')
+                    # Asterisks in displayed IPs must never expand local filenames.
+                    (directory / '61.228.123.456@api.ip.sb ').write_text('not a result')
                     env = dict(self.env, PATH=str(binaries) + os.pathsep + self.env['PATH'],
                                BASH_ENV=str(directory / 'startup.sh'), TEST_DIR=tmp, TEST_MODE=mode,
                                TEST_MTR_RC=str(mtr_rc), TEST_CURL_RC=str(curl_rc),
@@ -722,8 +724,9 @@ esac
                     args = ['bash', str(ROOT / 'ip.sh'), '--json' if json_output else '--no-color']
                     if mode == 'flag':
                         args.append('--mask-ip')
-                    result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=20)
+                    result = subprocess.run(args, env=env, cwd=directory, text=True, capture_output=True, timeout=20)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn('61.228.123.456', result.stdout)
                     data = json.loads((cache / 'last.json').read_text())
                     masked = mode != 'off'
                     self.assertEqual(data['ip_masked'], masked)
@@ -776,6 +779,12 @@ esac
                                 text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 1)
         self.assertIn('EGRESS_MASK_IP', result.stderr)
+
+    def test_mask_flag_documented_in_help(self):
+        result = subprocess.run(['bash', str(ROOT / 'ip.sh'), '--help'], env=self.env,
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('--mask-ip', result.stdout)
 
     def test_release_version_and_executable_links(self):
         readme = (ROOT / 'README.md').read_text()
